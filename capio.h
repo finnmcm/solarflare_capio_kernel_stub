@@ -47,6 +47,8 @@ typedef struct {
     bool            is_sliced;
     slice_def_t*    slice_definitions;
     size_t          slice_def_len;
+    void*           vm_object_handle;  /* persistent handle for cdev_pager */
+    vm_memattr_t    memattr;           /* 0 = default; non-zero = override page attr */
 } shared_mem_region_t;
 
 typedef struct {
