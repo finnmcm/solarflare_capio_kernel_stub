@@ -85,9 +85,10 @@ static const struct {
     uint16_t    device;
     const char *desc;
 } sfc7120_fbsd_devs[] = {
-    { 0x1924, 0x0903, "Solarflare SFN7xxx (Huntington / EF10) PF" },
-    { 0x1924, 0x1903, "Solarflare SFN7xxx (Huntington / EF10) VF" },
+    { 0x1924, 0x0903, "AMD Solarflare SFC9120 10G Ethernet Controller" },
+    { 0x1924, 0x0903, "AMD Solarflare SFC9120 10G Ethernet Controller" },
 };
+ 
 static const size_t sfc7120_dev_count =
     sizeof(sfc7120_fbsd_devs) / sizeof(sfc7120_fbsd_devs[0]);
 
@@ -212,42 +213,55 @@ sfc7120_fbsd_attach(device_t dev)
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
 
-    /* 1. Allocate BAR0 (function MMIO window). */
-    sc->mem_res_id = PCIR_BAR(0);
+    /* 1. Allocate BAR2 (function MMIO window). */
+    device_printf(dev, "TRACE: about to alloc BAR2\n");
+    sc->mem_res_id = PCIR_BAR(2); // by the user guide, BARO is I/O on EF10, BAR2 is the register window
     sc->mem_resource = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-        &sc->mem_res_id, RF_ACTIVE | RF_SHAREABLE);
+        &sc->mem_res_id, RF_ACTIVE); // freebsd returns null when you ask for a shared memory resource -> must be active
     if (sc->mem_resource == NULL) {
-        device_printf(dev, "could not allocate BAR0\n");
+        device_printf(dev, "could not allocate BAR2\n");
         error = ENXIO;
         goto fail_lock;
     }
     sc->mem_bus_tag = rman_get_bustag(sc->mem_resource);
     sc->mem_bsh     = rman_get_bushandle(sc->mem_resource);
+    device_printf(dev, "TRACE: BAR2 mapped, paddr=0x%lx size=0x%lx\n",
+        rman_get_start(sc->mem_resource), rman_get_size(sc->mem_resource));
     pci_enable_busmaster(dev);
 
     /* 2. Hardware bringup (MCDI handshake, queue init). */
+    device_printf(dev, "TRACE: calling hw_init\n");
     error = sfc7120_hw_init(sc);
     if (error != 0) {
         device_printf(dev, "hw_init failed: %d\n", error);
         goto fail_bar;
     }
+    device_printf(dev, "TRACE: hw_init done\n");
 
     /* 3. DMA buffer allocation. */
+    device_printf(dev, "TRACE: calling alloc_dma_resources\n");
     error = sfc7120_alloc_dma_resources(sc);
     if (error != 0) {
         device_printf(dev, "alloc_dma_resources failed: %d\n", error);
         goto fail_hw;
     }
+    device_printf(dev, "TRACE: alloc_dma_resources done\n");
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */
-    sc->cdev = make_dev_capio(&sfc7120_cdevsw, sc, 0,
-                              UID_ROOT, GID_WHEEL, 0600, "sfc7120pol");
+    device_printf(dev, "TRACE: calling make_dev_capio\n");
+    /* unit and name must be unique per device instance — two cards both
+     * attaching as "sfc7120pol" unit 0 causes make_dev to block on a
+     * duplicate devfs entry, hanging the kernel */
+    sc->cdev = make_dev_capio(&sfc7120_cdevsw, sc, device_get_unit(dev),
+                              UID_ROOT, GID_WHEEL, 0600, "sfc7120pol%d",
+                              device_get_unit(dev));
     if (sc->cdev == NULL) {
         error = ENOMEM;
         goto fail_dma;
     }
     sc->cdev->si_drv1 = sc;
+    device_printf(dev, "TRACE: cdev created\n");
 
     /* 5. Populate smem[]. The MMIO entry uses the BAR's physical address;
      *    DMA entries use the kernel virtual address of each allocation.
@@ -273,22 +287,28 @@ sfc7120_fbsd_attach(device_t dev)
     sc->smem[SFC7120_MMIO_REGION].is_sliced   = true;
     sc->smem[SFC7120_MMIO_REGION].slice_definitions = sfc7120_reg_slices;
     sc->smem[SFC7120_MMIO_REGION].slice_def_len     = SFC7120_MMIO_SLICE_COUNT;
+    device_printf(dev, "TRACE: smem populated\n");
 
     /* 6. init_capio_sc. MUST come AFTER make_dev_capio and AFTER smem[]
      *    is fully populated — capio.c stores a pointer to the array, not
      *    a copy, and registers the sealing key + cap_mtx. */
+    device_printf(dev, "TRACE: calling init_capio_sc\n");
     init_capio_sc(sc, &sfc7120_capio_ops, SFC7120_REGION_COUNT, sc->smem);
+    device_printf(dev, "TRACE: init_capio_sc done\n");
 
-    /* 7. Allocate vm_object_handle_t for each region. */
-    for (int i = 0; i < SFC7120_REGION_COUNT; i++) {
-        vm_object_handle_t *h = malloc(sizeof(*h), M_DEVBUF,
-                                       M_WAITOK | M_ZERO);
-        h->sc   = sc;
-        h->type = sc->smem[i].type;
-        sc->smem[i].vm_object_handle = h;
-    }
+    /* 7. Allocate vm_object_handle_t for each region. -- THIS IS WRONG AS CAPIO.C:395 HANDLES THIS ON MMAP CALLS */
+    // for (int i = 0; i < SFC7120_REGION_COUNT; i++) {
+    //     vm_object_handle_t *h = malloc(sizeof(*h), M_DEVBUF,
+    //                                    M_WAITOK | M_ZERO);
+    //     h->sc   = sc;
+    //     h->type = sc->smem[i].type;
+    //     sc->smem[i].vm_object_handle = h;
+    // }
 
     sc->device_attached = true;
+    // device_printf(dev, "TRACE: calling dump_regs\n"); -> apparently firmware needs to initialize the hardware registers first 
+    sfc7120_dump_regs(sc);
+    device_printf(dev, "sfc7120pol attached\n");
     return 0;
 
 fail_dma:
@@ -314,14 +334,17 @@ sfc7120_fbsd_detach(device_t dev)
     sc->dying = true;
     SFC7120_UNLOCK(sc);
 
+    
+    // from what i can tell capio handles this, thus the vm_object_handle fields don't exist yet 
+
     /* Free vm_object_handle allocations BEFORE destroy_dev — the pager may
-     * still reference them during teardown. */
-    for (int i = 0; i < SFC7120_REGION_COUNT; i++) {
-        if (sc->smem[i].vm_object_handle != NULL) {
-            free(sc->smem[i].vm_object_handle, M_DEVBUF);
-            sc->smem[i].vm_object_handle = NULL;
-        }
-    }
+    //  * still reference them during teardown. */
+    // for (int i = 0; i < SFC7120_REGION_COUNT; i++) {
+    //     if (sc->smem[i].vm_object_handle != NULL) {
+    //         free(sc->smem[i].vm_object_handle, M_DEVBUF);
+    //         sc->smem[i].vm_object_handle = NULL;
+    //     }
+    // }
 
     if (sc->cdev != NULL) {
         modmap_unregister_vaddr_callback(sc->cdev);
