@@ -226,8 +226,8 @@ sudo ./build.sh install     # kldunload old, kldload new
 
 | Vendor | Device ID | Description |
 |---|---|---|
-| 0x1924 | 0x0903 | Solarflare SFN7xxx (Huntington / EF10) PF |
-| 0x1924 | 0x1903 | Solarflare SFN7xxx (Huntington / EF10) VF |
+| 0x1924 | 0x0903 | Solarflare SFC9120 10G Ethernet Controller (EF10) PF |
+| 0x1924 | 0x1903 | Solarflare SFC9120 10G Ethernet Controller (EF10) VF |
 
 Confirm against the actual board with `pciconf -lv` and adjust
 `sfc7120_fbsd_devs[]` in `sfc7120.c`.

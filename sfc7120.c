@@ -85,8 +85,8 @@ static const struct {
     uint16_t    device;
     const char *desc;
 } sfc7120_fbsd_devs[] = {
-    { 0x1924, 0x0903, "Solarflare SFN7xxx (Huntington / EF10) PF" },
-    { 0x1924, 0x1903, "Solarflare SFN7xxx (Huntington / EF10) VF" },
+    { 0x1924, 0x0903, "Solarflare SFC9120 10G Ethernet Controller (EF10) PF" },
+    { 0x1924, 0x1903, "Solarflare SFC9120 10G Ethernet Controller (EF10) VF" },
 };
 static const size_t sfc7120_dev_count =
     sizeof(sfc7120_fbsd_devs) / sizeof(sfc7120_fbsd_devs[0]);
