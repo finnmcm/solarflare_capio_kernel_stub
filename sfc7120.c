@@ -19,6 +19,7 @@
 __FBSDID("$FreeBSD$");
 
 #include "sfc7120.h"
+#include "sfc7120_mcdi.h"
 #include "sfc7120_mmio.h"
 
 #if CROSS_COMPILE
@@ -158,27 +159,73 @@ sfc7120_free_dma_resources(sfc7120_softc_t *sc)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Hardware bringup — TODO: MCDI handshake, EVQ_INIT, RXQ_INIT, TXQ_INIT,  */
-/* MAC config, link config. EF10 talks to the MC firmware through a       */
-/* doorbell at BAR offset SFC7120_REG_MCDB and a DMA-resident message     */
-/* buffer; see the FreeBSD `sfxge` driver in the CheriBSD tree for a      */
-/* reference implementation.                                              */
+/* Hardware bringup. Stops here at MCDI + identity queries — EVQ/RXQ/TXQ  */
+/* init needs DMA rings, so it lives in a future sfc7120_hw_start() that  */
+/* runs after sfc7120_alloc_dma_resources(). The MCDI plumbing itself is  */
+/* in sfc7120_mcdi.c.                                                     */
 /* ---------------------------------------------------------------------- */
 
 static int
 sfc7120_hw_init(sfc7120_softc_t *sc)
 {
-    /* TODO: PCIe FLR, MCDI version handshake, GET_BOARD_CFG, GET_MAC_ADDR,
-     * INIT_EVQ, INIT_RXQ, INIT_TXQ, MAC_RECONFIG, link up. */
-    (void)sc;
+    int error;
+
+    error = sfc7120_pcie_flr(sc);
+    if (error != 0)
+        return error;
+
+    error = sfc7120_mcdi_init(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: mcdi_init failed: %d\n", error);
+        goto fail;
+    }
+
+    error = sfc7120_mcdi_get_version(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: GET_VERSION failed: %d\n", error);
+        goto fail_mcdi;
+    }
+
+    error = sfc7120_mcdi_drv_attach(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: DRV_ATTACH failed: %d\n", error);
+        goto fail_mcdi;
+    }
+
+    error = sfc7120_mcdi_get_mac(sc);
+    if (error != 0) {
+        device_printf(sc->dev,
+            "hw_init: GET_MAC_ADDRESSES failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    /* Single-channel stub: 1 VI is enough for one EVQ + one RXQ + one TXQ
+     * later. Increase max once multi-queue support lands. */
+    error = sfc7120_mcdi_alloc_vis(sc, 1, 1);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: ALLOC_VIS failed: %d\n", error);
+        goto fail_attach;
+    }
+
     return 0;
+
+fail_attach:
+    (void)sfc7120_mcdi_drv_detach(sc);
+fail_mcdi:
+    sfc7120_mcdi_fini(sc);
+fail:
+    return error;
 }
 
 static void
 sfc7120_hw_teardown(sfc7120_softc_t *sc)
 {
-    /* TODO: link down, FINI_TXQ, FINI_RXQ, FINI_EVQ, MCDI shutdown. */
-    (void)sc;
+    /* Reverse of hw_init. Each helper is a no-op if the corresponding
+     * stage never ran, so it's safe to call from partial-attach failure
+     * paths. */
+    (void)sfc7120_mcdi_free_vis(sc);
+    (void)sfc7120_mcdi_drv_detach(sc);
+    sfc7120_mcdi_fini(sc);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -217,7 +264,12 @@ sfc7120_fbsd_attach(device_t dev)
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
 
+/* 
+ *   The current attach order (sfc7120.c:241,250) is BAR → hw_init → alloc_dma_resources. That can't work as-is, because steps 7–10 below require DMA-allocated rings. Two clean options:
 
+  - (A) Split: keep hw_init for MCDI bringup + identity queries; introduce a new sfc7120_hw_start(sc) after alloc_dma_resources that runs the queue-init commands. This mirrors sfxge's
+  sfxge_create vs sfxge_start.
+  */
 
 
     /* 1. Allocate BAR2 (function MMIO window). */
@@ -244,6 +296,7 @@ sfc7120_fbsd_attach(device_t dev)
         goto fail_bar;
     }
     device_printf(dev, "TRACE: hw_init done\n");
+
 
     /* 3. DMA buffer allocation. */
     device_printf(dev, "TRACE: calling alloc_dma_resources\n");

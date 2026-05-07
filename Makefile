@@ -5,7 +5,7 @@
 # native make on CheriBSD.
 
 KMOD   = sfc7120pol
-SRCS   = sfc7120.c sfc7120_mmio.c sfc7120_tables.c capio.c \
+SRCS   = sfc7120.c sfc7120_mcdi.c sfc7120_mmio.c sfc7120_tables.c capio.c \
          device_if.h bus_if.h pci_if.h opt_platform.h ofw_bus_if.h
 
 .if defined(CROSS_COMPILE) && ${CROSS_COMPILE} == "1"

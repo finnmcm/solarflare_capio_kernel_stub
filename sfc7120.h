@@ -196,11 +196,28 @@ typedef struct sfc7120_softc {
     bool                dying;
     bool                mapped;
 
-    /* MCDI scratch — placeholder for the MC firmware command channel.
-     * EF10 talks to the MC via a doorbell + DMA mailbox; populate as needed
-     * during attach.bringup. */
+    /* MCDI: DMA-resident mailbox + bookkeeping for the MC firmware command
+     * channel. Populated by sfc7120_mcdi_init() during hw_init. The mailbox
+     * MUST be 256-byte aligned (EF10 doorbell recovery requirement, sfxge
+     * bug24769) — sfc7120_mcdi.c enforces that via bus_dma_tag_create. */
     void               *mcdi_buf;
     bus_addr_t          mcdi_buf_paddr;
+    bus_dma_tag_t       mcdi_dtag;
+    bus_dmamap_t        mcdi_dmamap;
+    struct mtx          mcdi_mtx;
+    uint8_t             mcdi_seq;        /* 4-bit sequence, increments per request */
+    bool                mcdi_new_epoch;  /* next request starts a new epoch */
+    bool                mcdi_initialized;
+
+    /* DRV_ATTACH / ALLOC_VIS results, populated during hw_init. */
+    uint32_t            mcdi_func_flags;  /* MC_CMD_DRV_ATTACH_EXT_OUT_FUNC_FLAGS */
+    uint32_t            vi_base;          /* base absolute VI for this function */
+    uint32_t            vi_count;         /* VIs allocated to this function */
+
+    /* GET_VERSION result (firmware build identifier). */
+    uint32_t            fw_version[2];    /* hi/lo pair */
+    bool                drv_attached;
+    bool                vis_allocated;
 
     bool                debug_reg_ops;
 } sfc7120_softc_t;
