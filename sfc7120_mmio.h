@@ -22,19 +22,27 @@
  * before depending on these.
  */
 
-/* MCDI request doorbell + return doorbell. EF10 keeps the MCDI message
- * itself in a DMA buffer; only the doorbell is in MMIO. */
-#define SFC7120_REG_MCDB            0x0e80    /* MC doorbell */
-#define SFC7120_REG_MC_EVENT        0x0e84
+/* MCDI request doorbell. EF10 splits this into a low-word (0x0200) and
+ * high-word (0x0204) register; for MCDI you only need to write the low word.
+ * Verified against ER_DZ_MC_DB_LWRD_REG_OFST in efx_regs_ef10.h. */
+#define SFC7120_REG_MCDB            0x0200    /* MC doorbell low word */
+/* #define SFC7120_REG_MC_EVENT — does not exist as an MMIO register on EF10.
+ * MC events are delivered through the EVQ ring (DMA buffer), not via a
+ * dedicated BAR address. No slice entry should reference this. */
 
-/* Per-channel doorbells (channel 0; per-channel stride is hardware-defined). */
-#define SFC7120_REG_EVQ_RPTR_DBL    0x0500
-#define SFC7120_REG_RX_DESC_DBL     0x0510
-#define SFC7120_REG_TX_DESC_DBL     0x0518
+/* Per-channel doorbells (channel 0; per-channel stride is hardware-defined).
+ * Verified against ER_DZ_EVQ_RPTR_REG_OFST, ER_DZ_RX_DESC_UPD_REG_OFST,
+ * and ER_DZ_TX_DESC_UPD_REG_OFST in efx_regs_ef10.h. */
+#define SFC7120_REG_EVQ_RPTR_DBL    0x0400
+#define SFC7120_REG_RX_DESC_DBL     0x0830
+#define SFC7120_REG_TX_DESC_DBL     0x0a10
 
-/* Boot/identity registers. */
-#define SFC7120_REG_BIU_HW_REV_ID   0x0010
-#define SFC7120_REG_MC_STATUS       0x0c7c
+/* Boot/identity registers.
+ * BIU_HW_REV_ID verified against ER_DZ_BIU_HW_REV_ID_REG_OFST in efx_regs_ef10.h. */
+#define SFC7120_REG_BIU_HW_REV_ID   0x0000
+/* #define SFC7120_REG_MC_STATUS — does not exist as an MMIO register on EF10.
+ * "MC_STATUS" in sfxge is a magic value (0xb007b007 / 0xdeaddead) written by
+ * firmware into the MCDI *response buffer* in DMA memory, not a BAR offset. */
 
 /* Userspace BAR window size — full BAR0. Caller must populate via
  * rman_get_size(). The slice manifest below is what bounds individual

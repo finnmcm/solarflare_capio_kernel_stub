@@ -11,11 +11,14 @@
  * This is the SHORT initial set covering the registers a CAPIO
  * userspace driver minimally needs:
  *
- *   - MC doorbell (RW)         — push MCDI requests
- *   - MC event doorbell (RO)   — read MC status
+ *   - MC doorbell (RW)               — push MCDI requests (low word only)
  *   - EVQ read-pointer doorbell (RW) — ack events
  *   - RX/TX descriptor doorbells (RW) — push producer pointer
- *   - HW_REV_ID (RO), MC_STATUS (RO) — sanity / health
+ *   - HW_REV_ID (RO)                 — sanity check at attach
+ *
+ * MC_EVENT and MC_STATUS are omitted: neither is a real BAR register on EF10.
+ * MC events arrive via the EVQ DMA ring; MC status is a magic value in the
+ * MCDI response buffer.
  *
  * Extend this table when adding multi-queue support. Mirror the per-queue
  * pattern from mlx5pol: one slice per channel, named with the channel
@@ -23,12 +26,14 @@
  */
 slice_def_t sfc7120_reg_slices[] = {
     { SFC7120_REG_MCDB,         "MC_DOORBELL",     false, 4 },
-    { SFC7120_REG_MC_EVENT,     "MC_EVENT",        true,  4 },
+    // { SFC7120_REG_MC_EVENT, "MC_EVENT", true, 4 },
+    // Not a BAR register — MC events come via the EVQ DMA ring, not MMIO.
     { SFC7120_REG_EVQ_RPTR_DBL, "EVQ_RPTR_DBL",    false, 4 },
     { SFC7120_REG_RX_DESC_DBL,  "RX_DESC_DBL",     false, 4 },
     { SFC7120_REG_TX_DESC_DBL,  "TX_DESC_DBL",     false, 4 },
     { SFC7120_REG_BIU_HW_REV_ID,"HW_REV_ID",       true,  4 },
-    { SFC7120_REG_MC_STATUS,    "MC_STATUS",       true,  4 },
+    // { SFC7120_REG_MC_STATUS, "MC_STATUS", true, 4 },
+    // Not a BAR register — MC_STATUS is a magic value in the MCDI DMA response buffer.
 };
 
 const size_t SFC7120_MMIO_SLICE_COUNT =
