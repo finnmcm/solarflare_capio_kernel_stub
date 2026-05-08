@@ -170,23 +170,50 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
 {
     int error;
 
+
     error = sfc7120_mcdi_init(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: mcdi_init failed: %d\n", error);
         goto fail;
     }
+    sfc7120_mcdi_log_mc_state(sc, "after mcdi_init");
 
     error = sfc7120_mcdi_get_version(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: GET_VERSION failed: %d\n", error);
         goto fail_mcdi;
     }
+    sfc7120_mcdi_log_mc_state(sc, "after GET_VERSION");
 
     error = sfc7120_mcdi_drv_attach(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: DRV_ATTACH failed: %d\n", error);
         goto fail_mcdi;
     }
+    sfc7120_mcdi_log_mc_state(sc, "after DRV_ATTACH");
+
+    /* Drain/clear any pending MC firmware assertion. Mirrors sfxge
+     * ef10_nic.c:1981-1991. */
+    error = sfc7120_mcdi_clear_assertions(sc);
+    if (error != 0) {
+        device_printf(sc->dev,
+            "hw_init: clear_assertions failed: %d\n", error);
+        goto fail_mcdi;
+    }
+    sfc7120_mcdi_log_mc_state(sc, "after GET_ASSERTS");
+
+    /* Per-function resource reset. Releases any VIs / queues / filters
+     * still tied to this PCI function from a previous load that didn't
+     * detach cleanly. Issued AFTER DRV_ATTACH because ENTITY_RESET checks
+     * SRIOV_CTG_GENERAL privilege which the function gains via TRUSTED in
+     * the DRV_ATTACH response. */
+    error = sfc7120_mcdi_entity_reset(sc);
+    if (error != 0) {
+        device_printf(sc->dev,
+            "hw_init: ENTITY_RESET failed: %d\n", error);
+        goto fail_attach;
+    }
+    sfc7120_mcdi_log_mc_state(sc, "after ENTITY_RESET");
 
     error = sfc7120_mcdi_get_mac(sc);
     if (error != 0) {
@@ -194,14 +221,27 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
             "hw_init: GET_MAC_ADDRESSES failed: %d\n", error);
         goto fail_attach;
     }
+    sfc7120_mcdi_log_mc_state(sc, "after GET_MAC");
 
-    /* Single-channel stub: 1 VI is enough for one EVQ + one RXQ + one TXQ
-     * later. Increase max once multi-queue support lands. */
-    error = sfc7120_mcdi_alloc_vis(sc, 1, 1);
+    /* Diagnostic: dump GET_PORT_ASSIGNMENT / GET_FUNCTION_INFO /
+     * GET_CAPABILITIES so we can see what the firmware thinks of this
+     * function before ALLOC_VIS. ALLOC_VIS=ENOENT typically means the
+     * function has no VI bank — that's most often caused by missing port
+     * binding or an unexpected datapath firmware variant. */
+    (void)sfc7120_mcdi_dump_func_info(sc);
+    sfc7120_mcdi_log_mc_state(sc, "after GET_*INFO dump");
+
+    /* min=1, max=32. Sfxge defaults to MIN(128, MAX(rxq_limit,txq_limit))
+     * (ef10_nic.c:2003-2004). Some firmware variants reject a max=1 request
+     * outright; widening the range lets the MC pick a number it's willing
+     * to grant. We only actually use one VI for now. */
+    error = sfc7120_mcdi_alloc_vis(sc, 1, 32);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: ALLOC_VIS failed: %d\n", error);
+        sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS fail");
         goto fail_attach;
     }
+    sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS");
 
     return 0;
 

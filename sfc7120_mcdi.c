@@ -55,8 +55,21 @@ __FBSDID("$FreeBSD$");
 /* MCDI v1 wire-format helpers.                                           */
 /* ---------------------------------------------------------------------- */
 
-#define MCDI_HEADER_LEN              4u   /* one 32-bit header word */
+/*
+ * MCDI v1 vs v2 framing:
+ *   - v1 has a single 32-bit header word with a 7-bit cmd field and 8-bit
+ *     datalen — opcodes 0..0x7E and payloads up to 252 bytes.
+ *   - v2 escape: v1 header carries cmd=MC_CMD_V2_EXTN (0x7F) and datalen=0.
+ *     A second 32-bit "extended header" follows at offset 4 carrying the
+ *     real 15-bit cmd and 10-bit length. The actual payload starts at
+ *     offset 8. Used for opcodes >= 0x7F or payloads > 252 bytes.
+ *   sfxge: efx_mcdi.c:296-327 picks the framing based on
+ *   MC_CMD_CMD_SPACE_ESCAPE_7 (0x7F) and MCDI_CTL_SDU_LEN_MAX_V1 (252).
+ */
+#define MCDI_HEADER_LEN              4u   /* v1 header word size */
+#define MCDI_V2_HEADER_LEN           8u   /* v1 + v2 ext header */
 #define MCDI_PAYLOAD_LEN_MAX_V1      0xfcu
+#define MC_CMD_V2_EXTN               0x7fu
 
 #define MCDI_HDR_CODE_SHIFT          0
 #define MCDI_HDR_CODE_MASK           0x7fu
@@ -68,6 +81,12 @@ __FBSDID("$FreeBSD$");
 #define MCDI_HDR_NOT_EPOCH_SHIFT     21
 #define MCDI_HDR_ERROR_SHIFT         22
 #define MCDI_HDR_RESPONSE_SHIFT      23
+
+/* v2 extended header (offset 4): cmd[14:0], len[25:16] */
+#define MCDI_V2_EXT_CMD_SHIFT        0
+#define MCDI_V2_EXT_CMD_MASK         0x7fffu
+#define MCDI_V2_EXT_LEN_SHIFT        16
+#define MCDI_V2_EXT_LEN_MASK         0x3ffu
 
 /* MC_CMD opcodes / message lengths used here. Values come from
  * ref_efx_regs_mcdi.h. */
@@ -98,6 +117,40 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_ALLOC_VIS_OUT_VI_BASE_OFST  4
 
 #define MC_CMD_FREE_VIS                   0x8c
+
+#define MC_CMD_GET_ASSERTS                0x06
+#define MC_CMD_GET_ASSERTS_IN_LEN         4
+#define MC_CMD_GET_ASSERTS_IN_CLEAR_OFST  0
+#define MC_CMD_GET_ASSERTS_OUT_LEN        140
+#define MC_CMD_GET_ASSERTS_OUT_GLOBAL_FLAGS_OFST 0
+#define MC_CMD_GET_ASSERTS_FLAGS_NO_FAILS 0x1
+
+#define MC_CMD_REBOOT                     0x3d
+#define MC_CMD_REBOOT_IN_LEN              4
+#define MC_CMD_REBOOT_IN_FLAGS_OFST       0
+#define MC_CMD_REBOOT_FLAGS_AFTER_ASSERTION 0x1
+
+#define MC_CMD_ENTITY_RESET               0x20
+#define MC_CMD_ENTITY_RESET_IN_LEN        4
+#define MC_CMD_ENTITY_RESET_IN_FLAG_OFST  0
+#define MC_CMD_ENTITY_RESET_IN_FUNCTION_RESOURCE_RESET 0x1u  /* bit 0 */
+
+#define MC_CMD_GET_PORT_ASSIGNMENT        0xb8
+#define MC_CMD_GET_PORT_ASSIGNMENT_OUT_LEN 4
+#define MC_CMD_GET_PORT_ASSIGNMENT_OUT_PORT_OFST 0
+
+#define MC_CMD_GET_FUNCTION_INFO          0xec
+#define MC_CMD_GET_FUNCTION_INFO_OUT_LEN  8
+#define MC_CMD_GET_FUNCTION_INFO_OUT_PF_OFST 0
+#define MC_CMD_GET_FUNCTION_INFO_OUT_VF_OFST 4
+
+#define MC_CMD_GET_CAPABILITIES           0xbe
+#define MC_CMD_GET_CAPABILITIES_OUT_LEN   20
+#define MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST 0
+#define MC_CMD_GET_CAPABILITIES_OUT_RX_DPCPU_FW_ID_OFST 4 /* 2 bytes */
+#define MC_CMD_GET_CAPABILITIES_OUT_TX_DPCPU_FW_ID_OFST 6 /* 2 bytes */
+#define MC_CMD_GET_CAPABILITIES_OUT_HW_CAPS_OFST 12 /* 4 bytes */
+#define MC_CMD_GET_CAPABILITIES_OUT_LICENSE_CAPS_OFST 16 /* 4 bytes */
 
 /* Polling parameters. Mirrors EF10_MCDI_CMD_TIMEOUT_US in sfxge. */
 #define SFC7120_MCDI_POLL_MIN_US         10
@@ -348,28 +401,56 @@ sfc7120_mcdi_fini(sfc7120_softc_t *sc)
 /* MCDI request/poll/read primitives. Caller must hold mcdi_mtx.          */
 /* ---------------------------------------------------------------------- */
 
-static void
+/* Build the MCDI request in the mailbox and ring the MC doorbell. Picks
+ * v1 or v2 framing based on opcode and payload size; returns the byte
+ * offset where the request/response payload starts (4 for v1, 8 for v2)
+ * so the caller knows where to read the response payload from. */
+static size_t
 sfc7120_mcdi_send_locked(sfc7120_softc_t *sc, uint32_t cmd,
                          const void *in, size_t in_len, uint8_t seq)
 {
-    uint32_t header;
+    uint32_t v1_hdr;
+    uint32_t v2_hdr;
     uint64_t paddr;
+    size_t   payload_off;
+    bool     use_v2 = (cmd >= MC_CMD_V2_EXTN) ||
+                      (in_len > MCDI_PAYLOAD_LEN_MAX_V1);
 
     mtx_assert(&sc->mcdi_mtx, MA_OWNED);
     KASSERT(in_len <= MCDI_PAYLOAD_LEN_MAX_V1,
-        ("MCDI v1 request payload too large: %zu", in_len));
+        ("MCDI request payload too large: %zu", in_len));
 
-    header  = (cmd & MCDI_HDR_CODE_MASK)        << MCDI_HDR_CODE_SHIFT;
-    header |= ((uint32_t)in_len & MCDI_HDR_DATALEN_MASK)
+    if (use_v2) {
+        /* v1 header carries the V2_EXTN escape opcode and zero datalen. */
+        v1_hdr  = (MC_CMD_V2_EXTN & MCDI_HDR_CODE_MASK)
+                                                << MCDI_HDR_CODE_SHIFT;
+        v1_hdr |= 0u                            << MCDI_HDR_DATALEN_SHIFT;
+        v1_hdr |= ((uint32_t)seq & MCDI_HDR_SEQ_MASK) << MCDI_HDR_SEQ_SHIFT;
+        if (!sc->mcdi_new_epoch)
+            v1_hdr |= 1u << MCDI_HDR_NOT_EPOCH_SHIFT;
+
+        /* v2 ext header carries the real cmd and request length. */
+        v2_hdr  = (cmd & MCDI_V2_EXT_CMD_MASK)  << MCDI_V2_EXT_CMD_SHIFT;
+        v2_hdr |= ((uint32_t)in_len & MCDI_V2_EXT_LEN_MASK)
+                                                << MCDI_V2_EXT_LEN_SHIFT;
+
+        mcdi_buf_write_dword(sc, 0, v1_hdr);
+        mcdi_buf_write_dword(sc, MCDI_HEADER_LEN, v2_hdr);
+        payload_off = MCDI_V2_HEADER_LEN;
+    } else {
+        v1_hdr  = (cmd & MCDI_HDR_CODE_MASK)    << MCDI_HDR_CODE_SHIFT;
+        v1_hdr |= ((uint32_t)in_len & MCDI_HDR_DATALEN_MASK)
                                                 << MCDI_HDR_DATALEN_SHIFT;
-    header |= ((uint32_t)seq & MCDI_HDR_SEQ_MASK) << MCDI_HDR_SEQ_SHIFT;
-    if (!sc->mcdi_new_epoch)
-        header |= 1u << MCDI_HDR_NOT_EPOCH_SHIFT;
-    /* RESPONSE/ERROR/RESYNC stay clear in a request. */
+        v1_hdr |= ((uint32_t)seq & MCDI_HDR_SEQ_MASK) << MCDI_HDR_SEQ_SHIFT;
+        if (!sc->mcdi_new_epoch)
+            v1_hdr |= 1u << MCDI_HDR_NOT_EPOCH_SHIFT;
 
-    mcdi_buf_write_dword(sc, 0, header);
+        mcdi_buf_write_dword(sc, 0, v1_hdr);
+        payload_off = MCDI_HEADER_LEN;
+    }
+
     if (in_len > 0)
-        mcdi_buf_write_payload(sc, MCDI_HEADER_LEN, in, in_len);
+        mcdi_buf_write_payload(sc, payload_off, in, in_len);
 
     /* Make sure the mailbox writes hit memory before the doorbell PIO. */
     bus_dmamap_sync(sc->mcdi_dtag, sc->mcdi_dmamap,
@@ -386,6 +467,8 @@ sfc7120_mcdi_send_locked(sfc7120_softc_t *sc, uint32_t cmd,
     SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_LWRD, (uint32_t)(paddr >> 32));
     SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_HWRD,
                       (uint32_t)(paddr & 0xffffffffu));
+
+    return payload_off;
 }
 
 
@@ -413,9 +496,11 @@ sfc7120_mcdi_xlate_err(uint32_t mc_err)
     case 0:   return 0;
     case 1:   return EPERM;
     case 2:   return ENOENT;
+    case 4:   return EINTR;
     case 5:   return EIO;
     case 11:  return EAGAIN;
     case 12:  return ENOMEM;
+    case 13:  return EACCES;
     case 16:  return EBUSY;
     case 22:  return EINVAL;
     case 38:  return ENOSYS;
@@ -440,6 +525,7 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     uint32_t delay_us;
     uint32_t total_us;
     uint8_t  seq;
+    size_t   payload_off;
     int rc;
 
     if (!sc->mcdi_initialized)
@@ -453,7 +539,7 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     SFC7120_MCDI_LOCK(sc);
 
     seq = sc->mcdi_seq & MCDI_HDR_SEQ_MASK;
-    sfc7120_mcdi_send_locked(sc, cmd, in, in_len, seq);
+    payload_off = sfc7120_mcdi_send_locked(sc, cmd, in, in_len, seq);
 
     delay_us = SFC7120_MCDI_POLL_MIN_US;
     total_us = 0;
@@ -509,9 +595,18 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
             delay_us = SFC7120_MCDI_POLL_MAX_US;
     }
 
-    /* Response is now in the mailbox. */
+    /* Response is now in the mailbox. v2 responses re-use the V2_EXTN
+     * escape: v1 header carries cmd=0x7f and datalen=0, with the real
+     * response length in the v2 ext header at offset 4. */
     header = mcdi_buf_read_dword(sc, 0);
-    resp_datalen = (header >> MCDI_HDR_DATALEN_SHIFT) & MCDI_HDR_DATALEN_MASK;
+    if (payload_off == MCDI_V2_HEADER_LEN) {
+        uint32_t v2_hdr = mcdi_buf_read_dword(sc, MCDI_HEADER_LEN);
+        resp_datalen = (v2_hdr >> MCDI_V2_EXT_LEN_SHIFT) &
+                       MCDI_V2_EXT_LEN_MASK;
+    } else {
+        resp_datalen = (header >> MCDI_HDR_DATALEN_SHIFT) &
+                       MCDI_HDR_DATALEN_MASK;
+    }
 
     uint8_t resp_seq = (header >> MCDI_HDR_SEQ_SHIFT) & MCDI_HDR_SEQ_MASK;
     if (resp_seq != seq) {
@@ -525,7 +620,7 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     if ((header >> MCDI_HDR_ERROR_SHIFT) & 0x1) {
         /* MC error: payload[0] is the MC_CMD_ERR_* code. */
         mc_err = (resp_datalen >= 4)
-            ? mcdi_buf_read_dword(sc, MCDI_HEADER_LEN) : 0;
+            ? mcdi_buf_read_dword(sc, payload_off) : 0;
         rc = sfc7120_mcdi_xlate_err(mc_err);
         device_printf(sc->dev,
             "MCDI cmd %#x failed: MC_CMD_ERR=%u (errno=%d)\n",
@@ -536,7 +631,7 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     if (out_len > 0 && out != NULL) {
         size_t copy = (resp_datalen < out_len) ? resp_datalen : out_len;
         if (copy > 0)
-            mcdi_buf_read_payload(sc, MCDI_HEADER_LEN, out, copy);
+            mcdi_buf_read_payload(sc, payload_off, out, copy);
         /* Zero anything the MC didn't fill so callers don't see stale
          * mailbox bytes. */
         if (copy < out_len)
@@ -559,6 +654,243 @@ out:
 /* ---------------------------------------------------------------------- */
 /* High-level MC_CMD wrappers.                                            */
 /* ---------------------------------------------------------------------- */
+
+/* Snapshot the BIU liveness register and MC soft status. Useful for
+ * pinpointing which MCDI command (if any) caused the MC to self-reboot:
+ * MC_SFT_STATUS increments on every MC reboot (low byte ~ reboot count),
+ * and HW_REV_ID drops to 0 while the BIU clock domain is gated. */
+void
+sfc7120_mcdi_log_mc_state(sfc7120_softc_t *sc, const char *tag)
+{
+    uint32_t hw_rev = SFC7120_READ_REG(sc, EF10_REG_BIU_HW_REV_ID);
+    uint32_t sft    = SFC7120_READ_REG(sc, EF10_REG_BIU_MC_SFT_STATUS);
+    device_printf(sc->dev,
+        "MC state @%s: HW_REV_ID=0x%08x MC_SFT_STATUS=0x%08x\n",
+        tag, hw_rev, sft);
+}
+
+int
+sfc7120_mcdi_clear_assertions(sfc7120_softc_t *sc)
+{
+    uint8_t  in[MC_CMD_GET_ASSERTS_IN_LEN]  = {0};
+    uint8_t  resp[MC_CMD_GET_ASSERTS_OUT_LEN] = {0};
+    size_t   used = 0;
+    uint32_t clear = 1;
+    uint32_t flags;
+    int      rc = 0;
+    int      retry;
+
+    memcpy(&in[MC_CMD_GET_ASSERTS_IN_CLEAR_OFST], &clear, 4);
+
+    /* sfxge retries this twice: a boot-time assertion can poison the very
+     * first MCDI exchange, and we may race with a partner-port driver also
+     * calling GET_ASSERTS (efx_mcdi.c:1192-1214). */
+    for (retry = 0; retry < 3; retry++) {
+        rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_ASSERTS,
+                               in, sizeof(in), resp, sizeof(resp), &used);
+        if (rc != EINTR && rc != EIO)
+            break;
+    }
+
+    if (rc == EACCES) {
+        /* Unprivileged function — partner driver will clear assertions. */
+        return 0;
+    }
+    if (rc != 0)
+        return rc;
+
+    if (used < 4) {
+        device_printf(sc->dev,
+            "MCDI GET_ASSERTS: short response (%zu bytes)\n", used);
+        return 0;
+    }
+    memcpy(&flags, &resp[MC_CMD_GET_ASSERTS_OUT_GLOBAL_FLAGS_OFST], 4);
+    device_printf(sc->dev, "MC GET_ASSERTS flags=%#x%s\n", flags,
+        (flags == MC_CMD_GET_ASSERTS_FLAGS_NO_FAILS)
+            ? " (no failures)" : " (assertion cleared)");
+    return 0;
+}
+
+int
+sfc7120_mcdi_entity_reset(sfc7120_softc_t *sc)
+{
+    uint8_t  in[MC_CMD_ENTITY_RESET_IN_LEN] = {0};
+    uint32_t flag = MC_CMD_ENTITY_RESET_IN_FUNCTION_RESOURCE_RESET;
+    int      rc;
+
+    /* Per-function resource reset. Releases any VIs / queues / filters
+     * still tied to this PCI function in the MC's bookkeeping, including
+     * leftovers from a previous load of this driver that didn't go through
+     * a clean detach. Does NOT reboot the MC. Mirrors the
+     * MC_CMD_ENTITY_RESET command (opcode 0x20) issued by sfxge in
+     * ef10_nic_reset (ef10_nic.c:2146-2155). */
+    memcpy(&in[MC_CMD_ENTITY_RESET_IN_FLAG_OFST], &flag, 4);
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_ENTITY_RESET, in, sizeof(in),
+                           NULL, 0, NULL);
+    if (rc == EACCES) {
+        device_printf(sc->dev,
+            "MCDI ENTITY_RESET: not permitted (unprivileged function?)\n");
+        return 0;
+    }
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI ENTITY_RESET failed: %d\n", rc);
+        return rc;
+    }
+    device_printf(sc->dev, "MC ENTITY_RESET (function resources): ok\n");
+    return 0;
+}
+
+/* Pure diagnostic. Runs three side-effect-free MCDI queries that sfxge
+ * executes in ef10_nic_board_cfg between DRV_ATTACH and ALLOC_VIS, and
+ * dumps their results. Helps narrow down why ALLOC_VIS returns ENOENT:
+ *
+ *  - GET_PORT_ASSIGNMENT: which port (0/1) the firmware has bound this
+ *    PF to. If this fails the function isn't bound to a port — that
+ *    alone would explain ALLOC_VIS=ENOENT.
+ *  - GET_FUNCTION_INFO: firmware's view of (PF, VF) for this function.
+ *    Confirms our identity and that we're a PF (vf == 0xffff).
+ *  - GET_CAPABILITIES: datapath firmware variant + capability flags.
+ *    The TX/RX datapath FW IDs tell us whether we have a "low-latency",
+ *    "full-featured", "DPDK", etc. variant — some variants gate VI
+ *    allocation on extra setup.
+ *
+ * Errors are non-fatal; we log and keep going so the rest of the trace
+ * is still produced. */
+int
+sfc7120_mcdi_dump_func_info(sfc7120_softc_t *sc)
+{
+    uint8_t  resp[MC_CMD_GET_CAPABILITIES_OUT_LEN] = {0};
+    size_t   used = 0;
+    uint32_t port = 0xffffffff;
+    uint32_t pf   = 0xffffffff;
+    uint32_t vf   = 0xffffffff;
+    uint32_t flags1;
+    int      rc;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_PORT_ASSIGNMENT,
+                           NULL, 0, resp, MC_CMD_GET_PORT_ASSIGNMENT_OUT_LEN,
+                           &used);
+    if (rc != 0) {
+        device_printf(sc->dev,
+            "MCDI GET_PORT_ASSIGNMENT failed: %d\n", rc);
+    } else if (used >= 4) {
+        memcpy(&port, &resp[MC_CMD_GET_PORT_ASSIGNMENT_OUT_PORT_OFST], 4);
+        device_printf(sc->dev,
+            "MC GET_PORT_ASSIGNMENT: port=%u\n", port);
+    }
+
+    memset(resp, 0, sizeof(resp));
+    used = 0;
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_FUNCTION_INFO,
+                           NULL, 0, resp, MC_CMD_GET_FUNCTION_INFO_OUT_LEN,
+                           &used);
+    if (rc != 0) {
+        device_printf(sc->dev,
+            "MCDI GET_FUNCTION_INFO failed: %d\n", rc);
+    } else if (used >= 8) {
+        memcpy(&pf, &resp[MC_CMD_GET_FUNCTION_INFO_OUT_PF_OFST], 4);
+        memcpy(&vf, &resp[MC_CMD_GET_FUNCTION_INFO_OUT_VF_OFST], 4);
+        /* Firmware returns vf=0xffff to mark "this is a PF" (sfxge:
+         * EFX_PCI_FUNCTION_IS_PF — efx_impl.h). Otherwise vf is the
+         * VF number and pf is the parent PF. */
+        device_printf(sc->dev,
+            "MC GET_FUNCTION_INFO: pf=%u vf=0x%x %s\n",
+            pf, vf, (vf == 0xffff) ? "(PF)" : "(VF)");
+    }
+
+    memset(resp, 0, sizeof(resp));
+    used = 0;
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_CAPABILITIES,
+                           NULL, 0, resp, MC_CMD_GET_CAPABILITIES_OUT_LEN,
+                           &used);
+    if (rc != 0) {
+        device_printf(sc->dev,
+            "MCDI GET_CAPABILITIES failed: %d\n", rc);
+    } else if (used >= MC_CMD_GET_CAPABILITIES_OUT_LEN) {
+        uint16_t rxdp_id, txdp_id;
+        uint32_t hw_caps, lic_caps;
+        memcpy(&flags1, &resp[MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST], 4);
+        memcpy(&rxdp_id,
+               &resp[MC_CMD_GET_CAPABILITIES_OUT_RX_DPCPU_FW_ID_OFST], 2);
+        memcpy(&txdp_id,
+               &resp[MC_CMD_GET_CAPABILITIES_OUT_TX_DPCPU_FW_ID_OFST], 2);
+        memcpy(&hw_caps,
+               &resp[MC_CMD_GET_CAPABILITIES_OUT_HW_CAPS_OFST], 4);
+        memcpy(&lic_caps,
+               &resp[MC_CMD_GET_CAPABILITIES_OUT_LICENSE_CAPS_OFST], 4);
+        device_printf(sc->dev,
+            "MC GET_CAPABILITIES: flags1=0x%08x rxdp_fw=0x%04x "
+            "txdp_fw=0x%04x hw_caps=0x%08x lic_caps=0x%08x\n",
+            flags1, le16toh(rxdp_id), le16toh(txdp_id),
+            hw_caps, lic_caps);
+    } else {
+        device_printf(sc->dev,
+            "MC GET_CAPABILITIES: short response (%zu bytes)\n", used);
+    }
+
+    return 0;
+}
+
+int
+sfc7120_mcdi_reboot_after_assertion(sfc7120_softc_t *sc)
+{
+    uint8_t  in[MC_CMD_REBOOT_IN_LEN] = {0};
+    uint32_t flags  = MC_CMD_REBOOT_FLAGS_AFTER_ASSERTION;
+    uint32_t hw_rev = 0;
+    int      rc;
+    int      waited_us;
+
+    memcpy(&in[MC_CMD_REBOOT_IN_FLAGS_OFST], &flags, 4);
+
+    /* Three outcomes:
+     *   1. No pending assertion → MC acks; exec returns 0 quickly.
+     *   2. Assertion + privileged function → MC reboots, response is lost,
+     *      exec times out (ETIMEDOUT). We then wait for BIU_HW_REV_ID to
+     *      come back to 0xeb14face and reset the MCDI epoch.
+     *   3. Unprivileged function → EACCES, treat as success.
+     * Mirrors sfxge efx_mcdi_do_reboot (efx_mcdi.c:1110-1157). */
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_REBOOT, in, sizeof(in), NULL, 0, NULL);
+
+    if (rc == 0 || rc == EACCES)
+        return 0;
+    if (rc != ETIMEDOUT && rc != EIO) {
+        device_printf(sc->dev,
+            "MCDI REBOOT(AFTER_ASSERTION) unexpected rc=%d\n", rc);
+        return rc;
+    }
+
+    /* MC is rebooting (or has rebooted). Wait up to 5s for the BIU clock
+     * domain to come back. Same pattern the post-FLR wait would use; see
+     * CLAUDE.md "Bringup notes". */
+    for (waited_us = 0; waited_us < 5 * 1000 * 1000; waited_us += 1000) {
+        hw_rev = SFC7120_READ_REG(sc, EF10_REG_BIU_HW_REV_ID);
+        if (hw_rev == EF10_REG_BIU_HW_REV_ID_RESET)
+            break;
+        DELAY(1000);
+    }
+    if (hw_rev != EF10_REG_BIU_HW_REV_ID_RESET) {
+        device_printf(sc->dev,
+            "MC reboot wait: BIU_HW_REV_ID=0x%08x after %d us\n",
+            hw_rev, waited_us);
+        return EIO;
+    }
+    device_printf(sc->dev,
+        "MC reboot recovered (BIU alive after %d us)\n", waited_us);
+
+    /* Reset MCDI epoch state. Post-reboot the MC counts seq from 0 again
+     * with NOT_EPOCH=0 expected on the first command. */
+    SFC7120_MCDI_LOCK(sc);
+    sc->mcdi_new_epoch = true;
+    sc->mcdi_seq       = 0;
+    SFC7120_MCDI_UNLOCK(sc);
+
+    /* Re-prime the doorbell — same kick that sfc7120_mcdi_init does after
+     * the BAR comes alive (sfxge bug24769 recovery). */
+    SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_HWRD, 1);
+
+    return 0;
+}
 
 int
 sfc7120_mcdi_get_version(sfc7120_softc_t *sc)
@@ -702,17 +1034,11 @@ sfc7120_mcdi_alloc_vis(sfc7120_softc_t *sc,
     size_t  used = 0;
     int     rc;
 
-    /*
-     * Release any VIs left over from a previous attach. Without FLR the
-     * firmware retains the previous driver's VI ownership across module
-     * unload/reload and ALLOC_VIS then fails with MC_CMD_ERR=95
-     * (EOPNOTSUPP). Sfxge does the same unconditional FREE_VIS before
-     * ALLOC_VIS — see ef10_nic.c:2218-2220. If no VIs are owned the MC
-     * may return a benign error; that's expected on first load.
-     */
-
-    rc = sfc7120_mcdi_exec(sc, MC_CMD_FREE_VIS, NULL, 0, NULL, 0, NULL);
-    device_printf(sc->dev, "MC_CMD_FREE_VIS returned: %d\n", rc);
+    /* The pre-ALLOC FREE_VIS that used to live here was redundant once
+     * sfc7120_hw_init runs MC_CMD_ENTITY_RESET (FUNCTION_RESOURCE_RESET)
+     * after DRV_ATTACH — that already releases any VIs the function held
+     * from a prior load. Dropping the FREE_VIS lets us see whether the MC
+     * reboots on FREE_VIS-of-nothing or only on ALLOC_VIS itself. */
 
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MIN_OFST], &min_count, 4);
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MAX_OFST], &max_count, 4);
