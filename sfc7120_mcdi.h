@@ -58,6 +58,11 @@ int  sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
                        void *out, size_t out_len, size_t *out_used);
 
 /* High-level wrappers used by sfc7120_hw_init / sfc7120_hw_teardown. */
+void sfc7120_mcdi_log_mc_state(sfc7120_softc_t *sc, const char *tag);
+int  sfc7120_mcdi_clear_assertions(sfc7120_softc_t *sc);
+int  sfc7120_mcdi_reboot_after_assertion(sfc7120_softc_t *sc);
+int  sfc7120_mcdi_entity_reset(sfc7120_softc_t *sc);
+int  sfc7120_mcdi_dump_func_info(sfc7120_softc_t *sc);
 int  sfc7120_mcdi_get_version(sfc7120_softc_t *sc);
 int  sfc7120_mcdi_drv_attach(sfc7120_softc_t *sc);
 int  sfc7120_mcdi_drv_detach(sfc7120_softc_t *sc);

@@ -170,11 +170,13 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
 {
     int error;
 
+
     error = sfc7120_mcdi_init(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: mcdi_init failed: %d\n", error);
         goto fail;
     }
+
 
     error = sfc7120_mcdi_get_version(sc);
     if (error != 0) {
@@ -182,11 +184,35 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_mcdi;
     }
 
+
     error = sfc7120_mcdi_drv_attach(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: DRV_ATTACH failed: %d\n", error);
         goto fail_mcdi;
     }
+
+
+    /* Drain/clear any pending MC firmware assertion. Mirrors sfxge
+     * ef10_nic.c:1981-1991. */
+    error = sfc7120_mcdi_clear_assertions(sc);
+    if (error != 0) {
+        device_printf(sc->dev,
+            "hw_init: clear_assertions failed: %d\n", error);
+        goto fail_mcdi;
+    }
+
+    /* Per-function resource reset. Releases any VIs / queues / filters
+     * still tied to this PCI function from a previous load that didn't
+     * detach cleanly. Issued AFTER DRV_ATTACH because ENTITY_RESET checks
+     * SRIOV_CTG_GENERAL privilege which the function gains via TRUSTED in
+     * the DRV_ATTACH response. */
+    error = sfc7120_mcdi_entity_reset(sc);
+    if (error != 0) {
+        device_printf(sc->dev,
+            "hw_init: ENTITY_RESET failed: %d\n", error);
+        goto fail_attach;
+    }
+
 
     error = sfc7120_mcdi_get_mac(sc);
     if (error != 0) {
@@ -195,13 +221,16 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
-    /* Single-channel stub: 1 VI is enough for one EVQ + one RXQ + one TXQ
-     * later. Increase max once multi-queue support lands. */
-    error = sfc7120_mcdi_alloc_vis(sc, 1, 1);
+    /* min=1, max=32. Sfxge defaults to MIN(128, MAX(rxq_limit,txq_limit))
+     * (ef10_nic.c:2003-2004). Some firmware variants reject a max=1 request
+     * outright; widening the range lets the MC pick a number it's willing
+     * to grant. We only actually use one VI for now. */
+    error = sfc7120_mcdi_alloc_vis(sc, 1, 32);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: ALLOC_VIS failed: %d\n", error);
+        sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS fail");
         goto fail_attach;
-    }
+    } 
 
     return 0;
 
@@ -259,28 +288,6 @@ sfc7120_fbsd_attach(device_t dev)
     //finn: sc_mtx : main device lock, protects fields touched by multiple contexts. mutex taken by any thread that wants to use shared fields
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
-
-/* 
- *   The current attach order (sfc7120.c:241,250) is BAR → hw_init → alloc_dma_resources. That can't work as-is, because steps 7–10 below require DMA-allocated rings. Two clean options:
-
-  - (A) Split: keep hw_init for MCDI bringup + identity queries; introduce a new sfc7120_hw_start(sc) after alloc_dma_resources that runs the queue-init commands. This mirrors sfxge's
-  sfxge_create vs sfxge_start.
-  */
-
-//finn: moving the full reset to BEFORE the bus alloc that enables mem writes
-/* DEBUG: FLR disabled to test whether the host-driven FLR is what wedges
- * MMIO on this -R2 PTP card. Stock sfxge does not FLR at attach. If reads
- * start returning 0xeb14face with FLR off, the card is FLR-sensitive and
- * we need a different reset path (MC_CMD_REBOOT via MCDI, or a soft reset
- * through ER_DZ_BIU_INT_ISR_REG). */
-#if 0
-    error = sfc7120_pcie_flr(sc);
-    if(error != 0){
-	goto fail_bar; //placeholder cuz idrk where to fail
-	 }
-#else
-    device_printf(dev, "TRACE: FLR DISABLED for this attach attempt\n");
-#endif
 
     /* 1. Allocate BAR2 (function MMIO window). */
     device_printf(dev, "TRACE: about to alloc BAR2\n");
