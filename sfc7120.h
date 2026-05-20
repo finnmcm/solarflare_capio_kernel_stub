@@ -238,6 +238,25 @@ typedef struct sfc7120_softc {
     bool rxq_initialized;
     bool txq_initialized;
 
+    /* PHY supported-capabilities mask harvested from MC_CMD_GET_PHY_CFG.
+     * Used as the SET_LINK advertisement mask. The MC firmware doesn't
+     * report the *_FEC_REQUESTED bits — we OR them in manually post-read
+     * to mirror sfxge ef10_nic.c:1869-1877. */
+    uint32_t            phy_supported_cap_mask;
+    uint32_t            phy_adv_cap_mask;
+    uint32_t            phy_media_type;
+
+    /* Link state populated by MC_CMD_GET_LINK. Updated by the
+     * post-SET_LINK poll in hw_init today, and (eventually) by the EVQ
+     * event handler when interrupts are wired. */
+    bool                link_up;
+    bool                full_duplex;
+    uint32_t            link_speed_mbps;
+    uint32_t            link_fcntl;
+
+    bool                mac_configured;
+    bool                link_configured;
+
     bool                debug_reg_ops;
 } sfc7120_softc_t;
 

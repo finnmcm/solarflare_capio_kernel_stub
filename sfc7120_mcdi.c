@@ -221,6 +221,73 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_GET_CAPABILITIES_OUT_HW_CAPS_OFST 12 /* 4 bytes */
 #define MC_CMD_GET_CAPABILITIES_OUT_LICENSE_CAPS_OFST 16 /* 4 bytes */
 
+/* MC_CMD_GET_PHY_CFG (0x24) — no IN payload; OUT layout per
+ * ref_efx_regs_mcdi.h. Only the fields we actually consume are named. */
+#define MC_CMD_GET_PHY_CFG                0x24
+#define MC_CMD_GET_PHY_CFG_OUT_LEN        72
+#define MC_CMD_GET_PHY_CFG_OUT_SUPPORTED_CAP_OFST 8
+#define MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST    44
+
+/* MC_CMD_SET_MAC (0x2c), v1 framing — 28-byte IN, no OUT. */
+#define MC_CMD_SET_MAC                    0x2c
+#define MC_CMD_SET_MAC_IN_LEN             28
+#define MC_CMD_SET_MAC_IN_MTU_OFST         0
+#define MC_CMD_SET_MAC_IN_DRAIN_OFST       4
+#define MC_CMD_SET_MAC_IN_ADDR_OFST        8   /* 8-byte slot, low 6 = MAC */
+#define MC_CMD_SET_MAC_IN_REJECT_OFST     16
+#define MC_CMD_SET_MAC_IN_FCNTL_OFST      20
+#define MC_CMD_SET_MAC_IN_FLAGS_OFST      24
+
+/* FCNTL enum (shared with MC_CMD_GET_LINK_OUT/FCNTL). */
+#define MC_CMD_FCNTL_OFF                  0x0
+#define MC_CMD_FCNTL_RESPOND              0x1
+#define MC_CMD_FCNTL_BIDIR                0x2
+#define MC_CMD_FCNTL_AUTO                 0x3
+#define MC_CMD_FCNTL_GENERATE             0x5
+
+/* MTU value sfxge programs at first bringup:
+ *   EFX_MAC_PDU(sdu) = roundup(sdu + 38, 8)
+ *   where 38 = EtherII(14) + VLAN(4) + CRC(4) + bug16011 pad(16).
+ * For default 1500 SDU that yields 1544. */
+#define SFC7120_DEFAULT_MAC_PDU           1544u
+
+/* MC_CMD_SET_LINK (0x2a) — 16-byte IN, no OUT. */
+#define MC_CMD_SET_LINK                   0x2a
+#define MC_CMD_SET_LINK_IN_LEN            16
+#define MC_CMD_SET_LINK_IN_CAP_OFST        0
+#define MC_CMD_SET_LINK_IN_FLAGS_OFST      4
+#define MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST  8
+#define MC_CMD_SET_LINK_IN_LOOPBACK_SPEED_OFST 12
+
+#define MC_CMD_LOOPBACK_NONE              0x0
+
+/* PHY capability bit positions used to build the SET_LINK CAP mask
+ * (also reported in GET_LINK_OUT/CAP). Names mirror sfxge. */
+#define MC_CMD_PHY_CAP_AN_LBN              10
+#define MC_CMD_PHY_CAP_BASER_FEC_LBN       16
+#define MC_CMD_PHY_CAP_BASER_FEC_REQUESTED_LBN 17
+#define MC_CMD_PHY_CAP_RS_FEC_LBN          18
+#define MC_CMD_PHY_CAP_RS_FEC_REQUESTED_LBN 19
+#define MC_CMD_PHY_CAP_25G_BASER_FEC_LBN   20
+#define MC_CMD_PHY_CAP_25G_BASER_FEC_REQUESTED_LBN 21
+
+/* MC_CMD_GET_LINK (0x29) — no IN; v1 OUT is 28 bytes, v2 is 44 bytes. */
+#define MC_CMD_GET_LINK                   0x29
+#define MC_CMD_GET_LINK_OUT_LEN           28
+#define MC_CMD_GET_LINK_OUT_V2_LEN        44
+#define MC_CMD_GET_LINK_OUT_CAP_OFST       0
+#define MC_CMD_GET_LINK_OUT_LP_CAP_OFST    4
+#define MC_CMD_GET_LINK_OUT_LINK_SPEED_OFST 8
+#define MC_CMD_GET_LINK_OUT_LOOPBACK_MODE_OFST 12
+#define MC_CMD_GET_LINK_OUT_FLAGS_OFST    16
+#define MC_CMD_GET_LINK_OUT_FCNTL_OFST    20
+#define MC_CMD_GET_LINK_OUT_MAC_FAULT_OFST 24
+
+#define MC_CMD_GET_LINK_OUT_LINK_UP_LBN      0
+#define MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN  1
+#define MC_CMD_GET_LINK_OUT_LINK_FAULT_RX_LBN 6
+#define MC_CMD_GET_LINK_OUT_LINK_FAULT_TX_LBN 7
+
 /* Polling parameters. Mirrors EF10_MCDI_CMD_TIMEOUT_US in sfxge. */
 #define SFC7120_MCDI_POLL_MIN_US         10
 #define SFC7120_MCDI_POLL_MAX_US         (100 * 1000)
@@ -1529,4 +1596,180 @@ sfc7120_mcdi_free_vis(sfc7120_softc_t *sc)
         sc->vi_base  = 0;
     }
     return rc;
+}
+
+/* ---------------------------------------------------------------------- */
+/* MAC / PHY / link bring-up. Issued from sfc7120_hw_init after the       */
+/* vAdaptor is allocated. Without these the MAC stays drained and the PHY */
+/* never negotiates a link, so no frames cross the wire even though the   */
+/* host-side queues are programmed.                                       */
+/*                                                                        */
+/* Reference: sfxge ef10_mac_reconfigure (ef10_mac.c:292-368),            */
+/* ef10_phy_reconfigure (ef10_phy.c:356-516), and ef10_phy_get_link       */
+/* (ef10_phy.c:284-353).                                                  */
+/* ---------------------------------------------------------------------- */
+
+int
+sfc7120_mcdi_get_phy_cfg(sfc7120_softc_t *sc)
+{
+    uint8_t  resp[MC_CMD_GET_PHY_CFG_OUT_LEN] = {0};
+    size_t   used = 0;
+    uint32_t supported_cap = 0;
+    uint32_t media_type = 0;
+    int      rc;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_PHY_CFG,
+                           NULL, 0, resp, sizeof(resp), &used);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI GET_PHY_CFG failed: %d\n", rc);
+        return rc;
+    }
+    if (used < MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST + 4) {
+        device_printf(sc->dev,
+            "MCDI GET_PHY_CFG: short response (%zu bytes)\n", used);
+        return EPROTO;
+    }
+
+    memcpy(&supported_cap,
+           &resp[MC_CMD_GET_PHY_CFG_OUT_SUPPORTED_CAP_OFST], 4);
+    memcpy(&media_type,
+           &resp[MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST], 4);
+
+    /* FEC quirk: firmware reports the *_FEC capability bits but omits the
+     * companion *_FEC_REQUESTED bits even when the PMD requires FEC. sfxge
+     * patches them in here so SET_LINK actually requests FEC on PMDs that
+     * need it (ef10_nic.c:1869-1877). */
+    if (supported_cap & (1u << MC_CMD_PHY_CAP_BASER_FEC_LBN))
+        supported_cap |= (1u << MC_CMD_PHY_CAP_BASER_FEC_REQUESTED_LBN);
+    if (supported_cap & (1u << MC_CMD_PHY_CAP_RS_FEC_LBN))
+        supported_cap |= (1u << MC_CMD_PHY_CAP_RS_FEC_REQUESTED_LBN);
+    if (supported_cap & (1u << MC_CMD_PHY_CAP_25G_BASER_FEC_LBN))
+        supported_cap |= (1u << MC_CMD_PHY_CAP_25G_BASER_FEC_REQUESTED_LBN);
+
+    sc->phy_supported_cap_mask = supported_cap;
+    sc->phy_media_type = media_type;
+
+    device_printf(sc->dev,
+        "MC GET_PHY_CFG: supported_cap=%#x media_type=%u\n",
+        supported_cap, media_type);
+    return 0;
+}
+
+int
+sfc7120_mcdi_set_mac(sfc7120_softc_t *sc)
+{
+    uint8_t  buf[MC_CMD_SET_MAC_IN_LEN] = {0};
+    uint32_t mtu = SFC7120_DEFAULT_MAC_PDU;
+    uint32_t drain = 0;
+    uint32_t reject = 0;
+    uint32_t fcntl = MC_CMD_FCNTL_AUTO;
+    uint32_t flags = 0;
+    int      rc;
+
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_MTU_OFST)    = mtu;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_DRAIN_OFST)  = drain;
+    /* ADDR is an 8-byte slot; only the low 6 bytes carry the MAC, the high
+     * 2 are zero (sfxge writes via an 8-byte EFX_MAC_ADDR_COPY that pads
+     * the top with zero — same effect). */
+    memcpy(buf + MC_CMD_SET_MAC_IN_ADDR_OFST, sc->mac_addr, 6);
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_REJECT_OFST) = reject;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FCNTL_OFST)  = fcntl;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FLAGS_OFST)  = flags;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_SET_MAC,
+                           buf, sizeof(buf), NULL, 0, NULL);
+    if (rc == EACCES) {
+        /* Unprivileged functions can't reconfigure the MAC. sfxge swallows
+         * this and lets filter setup proceed; do the same so a non-TRUSTED
+         * function still attaches. */
+        device_printf(sc->dev,
+            "MC SET_MAC: EACCES (unprivileged), continuing\n");
+        return 0;
+    }
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI SET_MAC failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->mac_configured = true;
+    device_printf(sc->dev,
+        "MC SET_MAC: addr=%02x:%02x:%02x:%02x:%02x:%02x mtu=%u fcntl=AUTO\n",
+        sc->mac_addr[0], sc->mac_addr[1], sc->mac_addr[2],
+        sc->mac_addr[3], sc->mac_addr[4], sc->mac_addr[5], mtu);
+    return 0;
+}
+
+int
+sfc7120_mcdi_set_link(sfc7120_softc_t *sc)
+{
+    uint8_t  buf[MC_CMD_SET_LINK_IN_LEN] = {0};
+    uint32_t cap;
+    int      rc;
+
+    /* Advertise everything the PHY supports. Ensure the AN bit is set so
+     * the firmware actually runs auto-negotiation with the link partner;
+     * GET_PHY_CFG normally reports AN as supported on EF10, but be defensive
+     * (sfxge does the same OR-in implicitly via its ep_adv_cap_mask seed). */
+    cap = sc->phy_supported_cap_mask | (1u << MC_CMD_PHY_CAP_AN_LBN);
+    sc->phy_adv_cap_mask = cap;
+
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_CAP_OFST)            = cap;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_FLAGS_OFST)          = 0;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST)  =
+        MC_CMD_LOOPBACK_NONE;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_LOOPBACK_SPEED_OFST) = 0;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_SET_LINK,
+                           buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI SET_LINK failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->link_configured = true;
+    device_printf(sc->dev, "MC SET_LINK: adv_cap=%#x\n", cap);
+    return 0;
+}
+
+int
+sfc7120_mcdi_get_link(sfc7120_softc_t *sc)
+{
+    uint8_t  resp[MC_CMD_GET_LINK_OUT_V2_LEN] = {0};
+    size_t   used = 0;
+    uint32_t link_speed = 0;
+    uint32_t link_flags = 0;
+    uint32_t fcntl = 0;
+    uint32_t mac_fault = 0;
+    int      rc;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_LINK,
+                           NULL, 0, resp, sizeof(resp), &used);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI GET_LINK failed: %d\n", rc);
+        return rc;
+    }
+    if (used < MC_CMD_GET_LINK_OUT_LEN) {
+        device_printf(sc->dev,
+            "MCDI GET_LINK: short response (%zu bytes)\n", used);
+        return EPROTO;
+    }
+
+    memcpy(&link_speed, &resp[MC_CMD_GET_LINK_OUT_LINK_SPEED_OFST], 4);
+    memcpy(&link_flags, &resp[MC_CMD_GET_LINK_OUT_FLAGS_OFST],      4);
+    memcpy(&fcntl,      &resp[MC_CMD_GET_LINK_OUT_FCNTL_OFST],      4);
+    memcpy(&mac_fault,  &resp[MC_CMD_GET_LINK_OUT_MAC_FAULT_OFST],  4);
+
+    sc->link_up = (link_flags & (1u << MC_CMD_GET_LINK_OUT_LINK_UP_LBN)) != 0;
+    sc->full_duplex =
+        (link_flags & (1u << MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN)) != 0;
+    sc->link_speed_mbps = link_speed;
+    sc->link_fcntl = fcntl;
+
+    device_printf(sc->dev,
+        "MC GET_LINK: speed=%u Mbps link=%s%s fcntl=%u mac_fault=%#x\n",
+        link_speed,
+        sc->link_up ? "UP" : "DOWN",
+        sc->full_duplex ? " FDX" : "",
+        fcntl, mac_fault);
+    return 0;
 }

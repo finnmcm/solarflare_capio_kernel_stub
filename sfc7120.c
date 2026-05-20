@@ -388,6 +388,49 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
+    /* MAC + PHY bring-up. Without these the MAC stays drained and the PHY
+     * never negotiates a link, so the host-side queues we program in
+     * sfc7120_fbsd_attach would never see traffic. Mirrors sfxge
+     * efx_port_init (efx_port.c:37-99). */
+    error = sfc7120_mcdi_get_phy_cfg(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: GET_PHY_CFG failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    error = sfc7120_mcdi_set_mac(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: SET_MAC failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    error = sfc7120_mcdi_set_link(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: SET_LINK failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    /* Poll GET_LINK until the link comes up, with a 3-second cap. sfxge
+     * doesn't poll — it waits for a firmware-generated LINKCHANGE EVQ
+     * event — but our interrupt handler is still TODO, so this poll gives
+     * us a usable bringup log line. A link-down outcome is non-fatal
+     * (cable could simply be unplugged).
+     * TODO: remove this poll once the EVQ event handler is wired. */
+    {
+        int i;
+        for (i = 0; i < 30; i++) {
+            (void)sfc7120_mcdi_get_link(sc);
+            if (sc->link_up)
+                break;
+            pause("sfclnk", hz / 10); /* 100 ms */
+        }
+        if (!sc->link_up) {
+            device_printf(sc->dev,
+                "hw_init: link still DOWN after %d ms; continuing\n",
+                i * 100);
+        }
+    }
+
     return 0;
 
 fail_attach:

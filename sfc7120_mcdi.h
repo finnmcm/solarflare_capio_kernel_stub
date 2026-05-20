@@ -83,4 +83,11 @@ int sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance, uint32_t targe
 int sfc7120_mcdi_fini_rxq(sfc7120_softc_t *sc, uint32_t instance);
 int sfc7120_mcdi_fini_txq(sfc7120_softc_t *sc, uint32_t instance);
 
+/* MAC / PHY / link bring-up wrappers. Issued from sfc7120_hw_init after
+ * MC_CMD_VADAPTOR_ALLOC; needed before the NIC will move frames. */
+int sfc7120_mcdi_get_phy_cfg(sfc7120_softc_t *sc);
+int sfc7120_mcdi_set_mac(sfc7120_softc_t *sc);
+int sfc7120_mcdi_set_link(sfc7120_softc_t *sc);
+int sfc7120_mcdi_get_link(sfc7120_softc_t *sc);
+
 #endif /* SFC7120_MCDI_H */

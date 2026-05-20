@@ -6,7 +6,7 @@ Out-of-tree workspace for the Solarflare SFN7000-series (Huntington / EF10)
 CAPIO kernel driver stub. Modeled on `~/CheriBsdE1000/`: cross-compile via
 bmake on Linux, native make on CheriBSD, output `sfc7120pol.ko`.
 
-**Status: ATTACHES CLEANLY WITH QUEUES INITIALIZED (as of 2026-05-18).**
+**Status: ATTACHES CLEANLY WITH MAC + PHY PROGRAMMED (as of 2026-05-19).**
 The PCI driver, CAPIO wiring, IOCTL dispatch, slice manifest, MCDI
 transport (v1 + v2 framing), identity bringup (`GET_VERSION` /
 `DRV_ATTACH` / `GET_MAC` / `GET_PORT_ASSIGNMENT` / `GET_FUNCTION_INFO` /
@@ -14,15 +14,20 @@ transport (v1 + v2 framing), identity bringup (`GET_VERSION` /
 clearing (`GET_ASSERTS`), VI allocation (`ALLOC_VIS` — 32 VIs at base
 1024 on PF1, base 1 on PF0), vAdaptor allocation
 (`VADAPTOR_ALLOC` on `EVB_PORT_ID_ASSIGNED` with `PERMIT_SET_MAC_*`
-cap-gated), and per-queue init (`INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` —
-512 descriptors each, all targeting EVQ 0) all succeed. The DMA mailbox,
-DMA rings + packet buffers, cdev creation, smem population, and
-`init_capio_sc` complete end-to-end; both PF0 and PF1 reach `sfc7120pol
-attached`.
+cap-gated), per-queue init (`INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` —
+512 descriptors each, all targeting EVQ 0), and **MAC + PHY bring-up
+(`GET_PHY_CFG` / `SET_MAC` / `SET_LINK` / polled `GET_LINK`)** all
+succeed. The DMA mailbox, DMA rings + packet buffers, cdev creation,
+smem population, and `init_capio_sc` complete end-to-end; both PF0 and
+PF1 reach `sfc7120pol attached`. With no SFP+ module / no cable / no
+peer on the front faceplate, `GET_LINK` reports `link=DOWN
+mac_fault=XGMII_LOCAL` for the full 3 s poll and attach continues
+gracefully — this is the **expected** outcome for an unwired port, not
+a driver failure (see "Bringup notes (2026-05-19)" below).
 
-Still **TODO**: MAC reconfiguration + link bring-up
-(`MC_CMD_SET_MAC` / `MC_CMD_SET_LINK`), MSI-X interrupt handler + EVQ
-event walking, TX/RX IOCTL bodies, in-tree copy at
+Still **TODO**: MSI-X interrupt handler + EVQ event walking
+(`LINKCHANGE` handling will replace the post-`SET_LINK` `GET_LINK`
+poll), TX/RX IOCTL bodies, in-tree copy at
 `~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
 `~/E1000Lwip/netif/sfc7120_driver.c`.
 
@@ -196,6 +201,84 @@ The current `sfc7120_mcdi_vadaptor_alloc` is a single-call wrapper
 matching sfxge's `efx_mcdi_vadaptor_alloc` exactly: cap-gated
 `PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED` flag, AUTO_MAC, no preemptive
 FREE.
+
+### Bringup notes (2026-05-19) — **MAC + PHY bring-up and the unwired-port `XGMII_LOCAL` signal**
+
+`MC_CMD_GET_PHY_CFG` (0x24), `MC_CMD_SET_MAC` (0x2c, v1 framing /
+`IN_LEN=28`), `MC_CMD_SET_LINK` (0x2a), and `MC_CMD_GET_LINK` (0x29)
+all succeed on first attach. Wired into `sfc7120_hw_init` immediately
+after `VADAPTOR_ALLOC`:
+
+```
+vadaptor_alloc
+get_phy_cfg     — reads SUPPORTED_CAP (caches in sc->phy_supported_cap_mask)
+                  and MEDIA_TYPE; applies the sfxge FEC-REQUESTED quirk
+                  (firmware omits *_FEC_REQUESTED bits even when supported,
+                  so we OR them in by hand).
+set_mac         — MTU=1544 (= EFX_MAC_PDU(1500) = roundup(1500+38, 8)),
+                  DRAIN=0, ADDR=sc->mac_addr, REJECT=0, FCNTL=AUTO,
+                  FLAGS=0. EACCES from the MC is non-fatal (matches sfxge's
+                  efx_mcdi_execute_quiet handling for unprivileged
+                  functions); on PF1 (LINKCTRL+TRUSTED) we get 0.
+set_link        — CAP = sc->phy_supported_cap_mask | PHY_CAP_AN,
+                  LOOPBACK_MODE = NONE, no flags. Kicks autoneg.
+get_link poll   — up to 30 × 100 ms (3 s cap) waiting for LINK_UP. Logs
+                  every iteration so you can see the negotiation timeline.
+                  Link-down at timeout is non-fatal; attach continues.
+```
+
+On the SFN7322F-R2 PF1 this prints:
+
+- `MC GET_PHY_CFG: supported_cap=0x7c0 media_type=5`
+  - `0x7c0` = `1000FDX | 10000FDX | PAUSE | ASYM | AN` (bits 6,7,8,9,10)
+  - `media_type=5` = `MC_CMD_MEDIA_SFP_PLUS`
+- `MC SET_MAC: addr=00:0f:53:28:54:91 mtu=1544 fcntl=AUTO`
+- `MC SET_LINK: adv_cap=0x7c0`
+- 30× `MC GET_LINK: speed=10000 Mbps link=DOWN FDX fcntl=2 mac_fault=0x1`
+- `hw_init: link still DOWN after 3000 ms; continuing`
+
+**The `mac_fault=0x1` (= `MC_CMD_MAC_FAULT_XGMII_LOCAL`) report when
+nothing is plugged into the SFP+ cage is expected and not a driver
+bug.** It's the local MAC saying "the local PHY isn't giving me valid
+10G symbols," which is exactly what happens when there's no SFP+
+module installed, no cable in the module, or no live link partner at
+the other end. The firmware also reports a non-zero `LINK_SPEED`
+(10000) and `FULL_DUPLEX=1` in this state — those are the *intended*
+post-negotiation values, not the actual link status. Trust the
+`LINK_UP` flag (bit 0 of FLAGS), not LINK_SPEED, for liveness.
+
+Also worth noting from this run: `GET_LINK` reports `fcntl=2`
+(`MC_CMD_FCNTL_BIDIR`) while link is down, even though `SET_MAC` was
+told `FCNTL_AUTO`. That's the firmware's default-pre-negotiation
+value; it'll be replaced by the auto-negotiated value once a peer
+comes up.
+
+**Why a synchronous poll instead of waiting for `LINKCHANGE`:** sfxge
+relies on a firmware-generated `LINKCHANGE` EVQ event to update link
+state and never spins on `GET_LINK`. Our EVQ event walker is still
+TODO, so the poll is a temporary scaffold to get a useful bringup
+log line. Marked `/* TODO: remove once interrupts land */` in
+`sfc7120_hw_init`. Once the EVQ event handler is wired, the natural
+flow is: program `SET_LINK`, return immediately, let the `LINKCHANGE`
+event update `sc->link_up` / `sc->link_speed_mbps` /
+`sc->full_duplex` asynchronously.
+
+**Why `SET_MAC` v1 instead of v2/EXT:** the EXT framing (`IN_LEN=32`
+with `CONTROL` bits) is for *selective* reconfiguration of individual
+fields and requires firmware to advertise the `SET_MAC_ENHANCED`
+capability. We don't currently parse that capability and don't have a
+use case for selective updates, so v1 is the right choice. sfxge's
+`ef10_mac_reconfigure` (`ef10_mac.c:292-368`) does the same thing —
+it only goes to EXT when `efx_mcdi_mtu_set` does an isolated MTU
+change. If we later need DRAIN-only toggling for graceful teardown,
+that's the spot to switch to EXT.
+
+**softc additions for this stage:** `phy_supported_cap_mask`,
+`phy_adv_cap_mask`, `phy_media_type`, `link_up`, `full_duplex`,
+`link_speed_mbps`, `link_fcntl`, `mac_configured`, `link_configured`.
+No `phy_*_configured` teardown gating needed — `ENTITY_RESET` on the
+next attach drops MAC/PHY state, and a graceful detach via DRAIN=1 +
+TXDIS=1 is optional polish, not required.
 
 ### Firmware variant (this card)
 
@@ -645,8 +728,10 @@ as authoritative.
 | EVQ init | Done | `MC_CMD_INIT_EVQ (0x80)` programs EVQ 0 with 512 entries, flags `0x39`, ring at `sc->evq_ring_paddr`. `fini_evq` is called in teardown. |
 | RXQ init | Done | `MC_CMD_INIT_RXQ (0x81)` programs RXQ 0 → EVQ 0, 512 descriptors, flags `0x300`, ring at `sc->rx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
 | TXQ init | Done | `MC_CMD_INIT_TXQ (0x82)` programs TXQ 0 → EVQ 0, 512 descriptors, flags `0x06`, ring at `sc->tx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
-| MAC reconfigure / link bring | **TODO** | `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE` and `MC_CMD_SET_LINK` not yet issued; the interface won't pass traffic until they are. |
-| Interrupt handler | **TODO** | Skeleton (`sfc7120_interrupt_handler`, `sfc7120_rx_task_handler`) exists but unused — will be wired once MSI-X allocation lands. |
+| PHY config discovery | Done | `MC_CMD_GET_PHY_CFG (0x24)` caches `SUPPORTED_CAP` and `MEDIA_TYPE` into `sc->phy_supported_cap_mask` / `sc->phy_media_type`. Applies the sfxge FEC-REQUESTED quirk. On SFN7322F-R2 PF1: `supported_cap=0x7c0` (`1000FDX|10000FDX|PAUSE|ASYM|AN`), `media_type=5` (`SFP_PLUS`). |
+| MAC reconfigure | Done | `MC_CMD_SET_MAC (0x2c)` v1 framing (`IN_LEN=28`). MTU=1544 (= `EFX_MAC_PDU(1500)`), DRAIN=0, ADDR=`sc->mac_addr`, REJECT=0, FCNTL=AUTO, FLAGS=0. EACCES is non-fatal. Mirrors sfxge `ef10_mac_reconfigure`. |
+| Link bring-up | Done | `MC_CMD_SET_LINK (0x2a)` advertises `sc->phy_supported_cap_mask \| PHY_CAP_AN`, LOOPBACK=NONE. `MC_CMD_GET_LINK (0x29)` parses both v1 (`OUT_LEN=28`) and v2 (`OUT_LEN=44`) responses into `sc->link_up` / `sc->link_speed_mbps` / `sc->full_duplex` / `sc->link_fcntl`. A 3 s / 30 × 100 ms `GET_LINK` poll in `hw_init` covers the gap until the EVQ event handler is wired — link-down at timeout is non-fatal. See "Bringup notes (2026-05-19)" for the unwired-port `XGMII_LOCAL` behavior. |
+| Interrupt handler | **TODO** | Skeleton (`sfc7120_interrupt_handler`, `sfc7120_rx_task_handler`) exists but unused — will be wired once MSI-X allocation lands. Wiring this also lets us delete the post-`SET_LINK` poll loop in `hw_init` (replaced by `LINKCHANGE` event handling). |
 | TX/RX IOCTLs (`SFC7120_TX`, `SFC7120_RX`) | **TODO** | Return ENOSYS today |
 | `SFC7120_GET_MAC` | Done | Returns `sc->mac_addr` populated by `MC_CMD_GET_MAC_ADDRESSES`. |
 | In-tree copy | Not yet | Add to `~/cheri/cheribsd/sys/modules/sfc7120pol/` once queue init lands. |
@@ -681,13 +766,18 @@ ring DMA addresses come from `sfc7120_alloc_dma_resources`. (We did
 for this firmware variant — `INIT_*Q` accepted the ring paddrs
 directly.) Reference: `ef10_ev.c`, `ef10_rx.c`, `ef10_tx.c` in sfxge.
 
-🔜 **MAC config + link bring** — `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE`,
-`MC_CMD_SET_LINK`, `MC_CMD_GET_LINK` to confirm.
+✅ **MAC config + link bring** — `MC_CMD_GET_PHY_CFG`,
+`MC_CMD_SET_MAC` (v1, 28 bytes), `MC_CMD_SET_LINK`, polled
+`MC_CMD_GET_LINK`. Wired into `sfc7120_hw_init` right after
+`vadaptor_alloc`. The poll is temporary scaffolding pending the EVQ
+event handler. See "Bringup notes (2026-05-19)".
 
 🔜 **Interrupt handler** — MSI-X allocation, EVQ event walking. The
 `sfc7120_interrupt_handler` and `sfc7120_rx_task_handler` skeletons
 already exist (currently unused, hence the `-Wunused-function`
 warnings during build — those will go away once they're wired).
+Wiring this also replaces the post-`SET_LINK` `GET_LINK` poll in
+`hw_init` with `LINKCHANGE` event handling, the way sfxge does it.
 
 🔜 **TX/RX IOCTLs** — kernel-mediated fallback paths for testing before
 the userspace driver lands.
@@ -751,8 +841,19 @@ Confirm against the actual board with `pciconf -lv` and adjust
   instance 0. Multi-queue (one queue per VI, RSS, etc.) is future
   work; the slice manifest will need extending to expose multiple
   doorbell windows then.
-- **No MAC / link config.** `MC_CMD_SET_MAC`, `MC_CMD_SET_LINK` aren't
-  called; the interface won't pass traffic until they are.
+- **Link comes up only with a real peer.** `SET_MAC` / `SET_LINK` run
+  on attach, but the SFN7322F-R2 needs an SFP+ module + cable + live
+  10G peer at the other end before `GET_LINK` reports `LINK_UP`. With
+  the cage empty (or cable unplugged), `GET_LINK` reports
+  `link=DOWN mac_fault=XGMII_LOCAL` and the 3-second poll in `hw_init`
+  times out gracefully. This is **expected**, not a driver bug —
+  attach still completes and the rest of the bringup is reachable.
+  The driver will pick up the link the moment a peer comes up once
+  the EVQ event handler is wired (LINKCHANGE event).
+- **GET_LINK polling is temporary scaffolding.** The 30-iteration
+  `GET_LINK` loop in `sfc7120_hw_init` exists because we don't yet
+  parse EVQ events. Delete the loop and rely on the LINKCHANGE event
+  handler the moment the interrupt path is functional.
 - **No interrupt path.** MSI-X allocation + EVQ walking still TODO.
   `sfc7120_interrupt_handler` is defined but unused (compiler warning).
   EVQ 0 is currently programmed with `INTERRUPTING` set (flags `0x39`
