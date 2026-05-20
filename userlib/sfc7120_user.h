@@ -7,18 +7,14 @@
 #include <sys/ioccom.h>
 
 #include "../sfc7120_uapi.h"
+#include "modmap.h"
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
 
-#define DEVSFC7120 "/dev/sfc7120pol1" // our actual module in tree 
+#define DEVSFC7120 "/dev/sfc7120pol1" // our actual module in tree
 #define DEVMODMAP  "/dev/modmap"
-
-typedef struct {
-    void * __capability user_cap;
-    void * __capability sealed_cap;
-} cap_req_t;
 
 typedef struct sfc7120_if { // state struct, everything we need from kernel stub 
     int     fd;

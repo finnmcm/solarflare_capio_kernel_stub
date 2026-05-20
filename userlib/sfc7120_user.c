@@ -5,7 +5,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
+
+static void *
+map_buffer(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type, size_t len)
+{
+    user_map_req_t map_req;
+    map_req.user_cap   = sfc->cap_req.user_cap;
+    map_req.sealed_cap = sfc->cap_req.sealed_cap;
+    map_req.map_type   = (int)map_type;
+
+    mmap_req_user_t req;
+    req.addr  = NULL;
+    req.len   = len;
+    req.prot  = PROT_READ | PROT_WRITE;
+    req.flags = MAP_SHARED;
+    req.fd    = sfc->fd;
+    req.pos   = 0;
+    req.extra = (void * __capability)(&map_req);
+
+    if (ioctl(sfc->modmap_fd, MODMAPIOC_MAP, &req) < 0) {
+        perror("sfc7120: MODMAPIOC_MAP failed");
+        return NULL;
+    }
+    return req.addr;
+}
 
 int
 sfc7120_init(sfc7120_if_t *sfc)
@@ -39,8 +64,19 @@ sfc7120_init(sfc7120_if_t *sfc)
         goto fail;
     }
 
-    /* TODO: mmap tx_buffer */
-    /* TODO: mmap rx_buffer */
+    sfc->tx_buffer = map_buffer(sfc, SFC7120_TX_BUFFER,
+                                SFC7120_NUM_TX_DESC * SFC7120_TX_BUFFER_SIZE);
+    if (sfc->tx_buffer == NULL) {
+        perror("sfc7120_init: map TX buffer");
+        goto fail;
+    }
+
+    sfc->rx_buffer = map_buffer(sfc, SFC7120_RX_BUFFER,
+                                SFC7120_NUM_RX_DESC * SFC7120_RX_BUFFER_SIZE);
+    if (sfc->rx_buffer == NULL) {
+        perror("sfc7120_init: map RX buffer");
+        goto fail;
+    }
 
     sfc7120_mac_req_t mac_req;
     mac_req.user_cap   = sfc->cap_req.user_cap;
