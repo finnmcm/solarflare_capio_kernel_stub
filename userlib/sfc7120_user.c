@@ -94,6 +94,60 @@ fail:
     return -1;
 }
 
+/*
+ * sfc7120_tx — send one packet through the kernel ioctl path (phase 1).
+ *
+ * Packages buf/len into a sfc7120_tx_req_t and hands it to the kernel via
+ * SFC7120_TX. The kernel copies the packet into the TX DMA buffer, writes
+ * a descriptor, rings the doorbell, and polls the EVQ for the TX completion
+ * event before returning. Blocking — returns 0 on success, -1 on failure.
+ */
+int
+sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len)
+{
+    sfc7120_tx_req_t req;
+    req.user_cap    = sfc->cap_req.user_cap;
+    req.sealed_cap  = sfc->cap_req.sealed_cap;
+    req.tx_buf_addr = (uint8_t * __capability)buf;
+    req.length      = len;
+    req.status      = 0;
+
+    if (ioctl(sfc->fd, SFC7120_TX, &req) < 0) {
+        perror("sfc7120_tx: SFC7120_TX");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * sfc7120_rx — receive one packet through the kernel ioctl path (phase 1).
+ *
+ * Passes buf to the kernel via SFC7120_RX. The kernel polls the EVQ until
+ * an RX event arrives, copies the packet from the DMA buffer into buf, and
+ * writes the byte count into *len_out. Blocking — returns 0 on success,
+ * -1 on failure (including ETIMEDOUT if no packet arrives in time).
+ */
+int
+sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out)
+{
+    sfc7120_rx_req_t req;
+    req.user_cap        = sfc->cap_req.user_cap;
+    req.sealed_cap      = sfc->cap_req.sealed_cap;
+    req.raw_buffer      = buf;
+    req.length_received = 0;
+    req.status          = 0;
+    req.error           = 0;
+
+    if (ioctl(sfc->fd, SFC7120_RX, &req) < 0) {
+        perror("sfc7120_rx: SFC7120_RX");
+        return -1;
+    }
+
+    if (len_out != NULL)
+        *len_out = req.length_received;
+    return 0;
+}
+
 void
 sfc7120_destroy(sfc7120_if_t *sfc)
 {

@@ -32,5 +32,7 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
 
 int  sfc7120_init(sfc7120_if_t *sfc);
 void sfc7120_destroy(sfc7120_if_t *sfc);
+int  sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len);
+int  sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out);
 
 #endif /* SFC7120_USER_H */
