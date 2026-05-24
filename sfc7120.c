@@ -798,14 +798,246 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         SFC7120_UNLOCK(sc);
         return 0;
     }
-    case SFC7120_TX:
-        /* TODO: validate user cap (tag/perm/length) and copyin into the
-         * TX descriptor ring. See e1000_fbsd_raw_transmit() for the
-         * cheri_gettag / cheri_getperm / cheri_getlen pattern. */
-        return ENOSYS;
-    case SFC7120_RX:
-        /* TODO: copyout received packets. */
-        return ENOSYS;
+    case SFC7120_TX: {
+        /*
+         * Phase 1 TX ioctl handler.
+         *
+         * Userspace passes a CHERI capability (tx_buf_addr) pointing at the
+         * packet to send, and a byte length. We:
+         *   1. Validate the capability — must be tagged, must be readable,
+         *      must cover at least `length` bytes.
+         *   2. Copy the packet from userspace into the next slot in the TX
+         *      DMA buffer (sc->tx_buffer), which is system RAM the NIC can
+         *      reach over PCIe.
+         *   3. Write an 8-byte TX descriptor into sc->tx_desc_ring at
+         *      tx_head, telling the NIC the physical address and length.
+         *   4. Ring the TX doorbell so the NIC goes and sends it.
+         *   5. Poll the EVQ until a TX completion event arrives confirming
+         *      the NIC is done with that descriptor.
+         *   6. Advance tx_head and clean up the EVQ slot.
+         */
+        sfc7120_tx_req_t *req = (sfc7120_tx_req_t *)data;
+
+        /* --- Step 1: validate CHERI capability --- */
+        if (!cheri_gettag(req->tx_buf_addr))
+            return EINVAL;
+        if (!(cheri_getperm(req->tx_buf_addr) & CHERI_PERM_LOAD))
+            return EPERM;
+        if (req->length == 0 || req->length > SFC7120_TX_BUFFER_SIZE)
+            return EINVAL;
+        if (cheri_getlen(req->tx_buf_addr) < req->length)
+            return EINVAL;
+
+        /* --- Step 2: copy packet into TX DMA buffer slot --- */
+        SFC7120_LOCK(sc);
+
+        uint8_t *slot_va = (uint8_t *)sc->tx_buffer +
+                           sc->tx_head * SFC7120_TX_BUFFER_SIZE;
+        bus_addr_t slot_pa = sc->tx_buffer_paddr +
+                             sc->tx_head * SFC7120_TX_BUFFER_SIZE;
+
+        int copy_err = copyin(req->tx_buf_addr, slot_va, req->length);
+        if (copy_err != 0) {
+            SFC7120_UNLOCK(sc);
+            return copy_err;
+        }
+
+        /* Flush the packet bytes to DMA memory before writing the
+         * descriptor — the NIC must see the data before it sees the
+         * descriptor that points to it. */
+        bus_dmamap_sync(sc->tx_buffer_dtag, sc->tx_buffer_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        /* --- Step 3: write TX descriptor ---
+         * 8-byte EF10 TX kernel descriptor layout (efx_regs_ef10.h):
+         *   bit[63]      TYPE  = 0  (kernel descriptor, not PIO)
+         *   bit[62]      CONT  = 0  (last/only segment — EOP)
+         *   bits[61:48]  BYTE_CNT   packet length (14 bits)
+         *   bits[47:32]  BUF_ADDR upper 16 bits of 48-bit physical address
+         *   bits[31:0]   BUF_ADDR lower 32 bits of physical address
+         */
+        uint64_t tx_desc =
+            ((uint64_t)(req->length & 0x3fff)        << 48) |
+            ((uint64_t)((slot_pa >> 32) & 0xffff)    << 32) |
+            ((uint64_t)(slot_pa & 0xffffffff));
+
+        volatile uint64_t *tx_ring = (volatile uint64_t *)sc->tx_desc_ring;
+        tx_ring[sc->tx_head] = tx_desc;
+
+        bus_dmamap_sync(sc->tx_desc_dtag, sc->tx_desc_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        /* --- Step 4: ring TX doorbell ---
+         * Write the new producer index (tx_head + 1) so the NIC knows one
+         * new descriptor is ready. The NIC reads the descriptor, fetches the
+         * packet from DMA memory, and transmits it. */
+        int posted_idx = sc->tx_head;
+        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_DESC_DBL,
+                          (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1));
+
+        /* --- Step 5: poll EVQ for TX completion ---
+         * The NIC posts an 8-byte TX_EV event to the EVQ when it finishes
+         * sending. Event layout (efx_regs_ef10.h):
+         *   bits[63:60]  EV_CODE = 2 (TX_EV)
+         *   bits[15:0]   TX_DESCR_INDX — index of completed descriptor
+         *
+         * We spin up to 10000 iterations waiting for it. */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        int tx_done = 0;
+        for (int tries = 0; tries < 10000 && !tx_done; tries++) {
+            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+                            BUS_DMASYNC_POSTREAD);
+            uint64_t ev = evq[sc->evq_read_ptr];
+
+            /* All-ones or all-zeros means no event written yet. */
+            if (ev == 0xffffffffffffffffULL || ev == 0)
+                continue;
+
+            uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+            if (code == 2) { /* TX_EV */
+                uint32_t comp_idx = (uint32_t)(ev & 0xffff);
+                if (comp_idx == (uint32_t)posted_idx) {
+                    tx_done = 1;
+                }
+            }
+
+            /* Consume the event regardless — advance past it. */
+            evq[sc->evq_read_ptr] = 0;
+            sc->evq_read_ptr =
+                (sc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
+                              (uint32_t)sc->evq_read_ptr);
+        }
+
+        /* --- Step 6: advance tx_head --- */
+        sc->tx_head = (sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
+        req->status = tx_done ? 0 : ETIMEDOUT;
+
+        SFC7120_UNLOCK(sc);
+        return tx_done ? 0 : ETIMEDOUT;
+    }
+    case SFC7120_RX: {
+        /*
+         * Phase 1 RX ioctl handler.
+         *
+         * The NIC DMAs incoming packets into the RX buffer slots we
+         * pre-posted in sfc7120_post_rx_buffers. When it finishes filling
+         * a slot it posts an 8-byte RX_EV event on the EVQ. We:
+         *   1. Poll the EVQ until an RX_EV (code=0) arrives.
+         *   2. Extract the byte count from the event.
+         *   3. Verify the low 4 bits of the descriptor index match rx_head
+         *      so we know we are reading the right slot.
+         *   4. Copy the packet out of the DMA buffer slot to userspace.
+         *   5. Re-post that descriptor so the NIC can reuse the slot.
+         *   6. Ring the RX doorbell and advance rx_head.
+         *
+         * RX_EV layout (efx_regs_ef10.h):
+         *   bits[63:60]  EV_CODE = 0
+         *   bits[51:48]  RX_DSC_PTR_LBITS — low 4 bits of descriptor index
+         *   bits[13:0]   RX_BYTES — byte count of received packet
+         */
+        sfc7120_rx_req_t *req = (sfc7120_rx_req_t *)data;
+
+        SFC7120_LOCK(sc);
+
+        /* --- Step 1: poll EVQ for an RX event --- */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        int    rx_found = 0;
+        uint32_t rx_bytes = 0;
+
+        for (int tries = 0; tries < 100000 && !rx_found; tries++) {
+            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+                            BUS_DMASYNC_POSTREAD);
+            uint64_t ev = evq[sc->evq_read_ptr];
+
+            if (ev == 0xffffffffffffffffULL || ev == 0)
+                continue;
+
+            uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+            if (code == 0) { /* RX_EV */
+                /* --- Step 2: extract byte count and descriptor index --- */
+                rx_bytes = (uint32_t)(ev & 0x3fff);
+                uint32_t dsc_lbits = (uint32_t)((ev >> 48) & 0xf);
+
+                /* --- Step 3: verify we are on the right slot ---
+                 * The event only carries the low 4 bits of the descriptor
+                 * index. We cross-check against the low 4 bits of rx_head
+                 * to confirm they match. If they don't, something has gone
+                 * out of sync — bail rather than copying from the wrong
+                 * slot. */
+                if ((sc->rx_head & 0xf) != dsc_lbits) {
+                    device_printf(sc->dev,
+                        "RX ioctl: dsc_lbits mismatch: event=%u rx_head=%u\n",
+                        dsc_lbits, sc->rx_head & 0xf);
+                    evq[sc->evq_read_ptr] = 0;
+                    sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
+                                       (SFC7120_NUM_EVQ_ENTRY - 1);
+                    SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
+                                      (uint32_t)sc->evq_read_ptr);
+                    SFC7120_UNLOCK(sc);
+                    return EIO;
+                }
+                rx_found = 1;
+            }
+
+            /* Consume event regardless of type. */
+            evq[sc->evq_read_ptr] = 0;
+            sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
+                               (SFC7120_NUM_EVQ_ENTRY - 1);
+            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
+                              (uint32_t)sc->evq_read_ptr);
+        }
+
+        if (!rx_found) {
+            SFC7120_UNLOCK(sc);
+            return ETIMEDOUT;
+        }
+
+        /* --- Step 4: copy packet from DMA slot to userspace ---
+         * sc->rx_buffer is the virtual address the CPU uses to read the
+         * DMA memory. We sync first to ensure the NIC's DMA writes are
+         * visible to the CPU, then copyout to userspace. */
+        uint8_t *slot_va = (uint8_t *)sc->rx_buffer +
+                           sc->rx_head * SFC7120_RX_BUFFER_SIZE;
+
+        bus_dmamap_sync(sc->rx_buffer_dtag, sc->rx_buffer_dmamap,
+                        BUS_DMASYNC_POSTREAD);
+
+        int copy_err = copyout(slot_va, req->raw_buffer, rx_bytes);
+        if (copy_err != 0) {
+            SFC7120_UNLOCK(sc);
+            return copy_err;
+        }
+        req->length_received = rx_bytes;
+
+        /* --- Step 5: re-post the descriptor for this slot ---
+         * We just consumed the slot — write the descriptor back into the
+         * ring so the NIC knows it can reuse this buffer for the next
+         * incoming packet. Same format as sfc7120_post_rx_buffers. */
+        volatile uint64_t *rx_ring = (volatile uint64_t *)sc->rx_desc_ring;
+        bus_addr_t slot_pa = sc->rx_buffer_paddr +
+                             sc->rx_head * SFC7120_RX_BUFFER_SIZE;
+        uint64_t desc =
+            ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff)    << 48) |
+            ((uint64_t)((slot_pa >> 32) & 0xffff)            << 32) |
+            ((uint64_t)(slot_pa & 0xffffffff));
+        rx_ring[sc->rx_head] = desc;
+
+        bus_dmamap_sync(sc->rx_desc_dtag, sc->rx_desc_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        /* --- Step 6: ring RX doorbell and advance rx_head ---
+         * Write the current rx_head as the new producer pointer. This
+         * hands the re-posted slot back to the NIC. Then advance rx_head
+         * to the next expected slot. */
+        SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL,
+                          (uint32_t)sc->rx_head);
+        sc->rx_head = (sc->rx_head + 1) & (SFC7120_NUM_RX_DESC - 1);
+
+        req->status = 0;
+        SFC7120_UNLOCK(sc);
+        return 0;
+    }
     default:
         return ENOTTY;
     }
