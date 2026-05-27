@@ -1230,6 +1230,12 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
      *     into a vector until we wire up bus_setup_intr later.
      * Bits: INTERRUPTING=0, CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
     uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
+    
+    // ARTHUR : this flag apparently tells our NIC to fire an interrupt every time we post an event to this ring
+    // this means that a cable being plugged correctly recognizes a CABLE_LINK event, however 
+    // it also means that incoming packet events trigger interrupts which is botched and will probably cause a race condition 
+    // with our user level approach to dumping the data events 
+    // TLDR we need to seperate the control event queue from the data event queue so we only scan the control queue for interrupts. 
     if (instance == 0)
         flags |= (1u << 0);
 
