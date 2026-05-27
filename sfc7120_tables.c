@@ -25,15 +25,14 @@
  * index suffix.
  */
 slice_def_t sfc7120_reg_slices[] = {
-    { SFC7120_REG_MCDB,         "MC_DOORBELL",     false, 4 },
-    // { SFC7120_REG_MC_EVENT, "MC_EVENT", true, 4 },
-    // Not a BAR register — MC events come via the EVQ DMA ring, not MMIO.
-    { SFC7120_REG_EVQ_RPTR_DBL, "EVQ_RPTR_DBL",    false, 4 },
-    { SFC7120_REG_RX_DESC_DBL,  "RX_DESC_DBL",     false, 4 },
-    { SFC7120_REG_TX_DESC_DBL,  "TX_DESC_DBL",     false, 4 },
-    { SFC7120_REG_BIU_HW_REV_ID,"HW_REV_ID",       true,  4 },
-    // { SFC7120_REG_MC_STATUS, "MC_STATUS", true, 4 },
-    // Not a BAR register — MC_STATUS is a magic value in the MCDI DMA response buffer.
+    { SFC7120_REG_MCDB,         "MC_DOORBELL",     false, 4  },
+    { SFC7120_REG_EVQ_RPTR_DBL, "EVQ_RPTR_DBL",    false, 4  },
+    { SFC7120_REG_RX_DESC_DBL,  "RX_DESC_DBL",     false, 4  },
+    /* TX_DESC_UPD is a 128-bit (16-byte) register.  The userspace driver needs
+     * two dwords: base+0 (descriptor LWORD) and base+8 (wptr-only push, dword[2]
+     * = ERF_DZ_TX_DESC_WPTR).  12 bytes covers both without exposing dword[3]. */
+    { SFC7120_REG_TX_DESC_DBL,  "TX_DESC_DBL",     false, 12 },
+    { SFC7120_REG_BIU_HW_REV_ID,"HW_REV_ID",       true,  4  },
 };
 
 const size_t SFC7120_MMIO_SLICE_COUNT =

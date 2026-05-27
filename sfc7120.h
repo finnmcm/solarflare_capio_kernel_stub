@@ -198,6 +198,10 @@ typedef struct sfc7120_softc {
     bus_dmamap_t        rx_buffer_dmamap;
     bool                rx_buffer_mapped;
     int                 rx_head;
+    /* Pending-frame state: set by ISR (sc_mtx held), consumed by SFC7120_RX. */
+    int                 rx_pending_slot;   /* ring slot of last received frame */
+    uint32_t            rx_event_bytes;    /* bytes from last RX event (prefix+frame) */
+    int                 rx_pushed;         /* un-masked producer counter for wptr guard */
 
     /* Lifecycle */
     bool                device_attached;
@@ -244,6 +248,12 @@ typedef struct sfc7120_softc {
     bool vadaptor_allocated;
     bool rxq_initialized;
     bool txq_initialized;
+
+    /* RX filter (MC_CMD_FILTER_OP). Inserted after INIT_RXQ so matching RX
+     * frames are steered to RX queue 0; the firmware-returned 64-bit handle
+     * is needed to remove it on teardown. */
+    uint64_t rx_filter_handle;
+    bool     rx_filter_inserted;
 
     /* PHY supported-capabilities mask harvested from MC_CMD_GET_PHY_CFG.
      * Used as the SET_LINK advertisement mask. The MC firmware doesn't

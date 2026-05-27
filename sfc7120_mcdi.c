@@ -213,6 +213,43 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_VADAPTOR_FREE_IN_UPSTREAM_PORT_ID_OFST   0
 #define MC_CMD_VADAPTOR_FREE_OUT_LEN                    0
 
+/* MC_CMD_FILTER_OP (0x8a) — RX/TX filter insert/remove. The base msgrequest
+ * is 108 bytes (EXT_IN is 172, V3_IN 180; sfxge sends V3, but Huntington fw
+ * accepts the base layout). Opcode >= 0x80, so sfc7120_mcdi_exec auto-selects
+ * v2 framing — do not special-case it.
+ *
+ * CRITICAL: the match VALUE fields (MACs, ports, ethertype) go on the wire in
+ * NETWORK (big-endian) byte order, unlike every other MCDI field — see the
+ * memcpy in sfc7120_mcdi_filter_insert and ef10_filter.c. The dword fields
+ * below (OP / PORT_ID / MATCH_FIELDS / RX_* / TX_DEST) are ordinary
+ * little-endian MCDI integers. */
+#define MC_CMD_FILTER_OP                                0x8a
+#define MC_CMD_FILTER_OP_IN_LEN                         108
+#define MC_CMD_FILTER_OP_IN_OP_OFST                      0
+#define MC_CMD_FILTER_OP_IN_OP_INSERT                   0x0
+#define MC_CMD_FILTER_OP_IN_OP_REMOVE                   0x1
+#define MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST               4
+#define MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST               8
+#define MC_CMD_FILTER_OP_IN_PORT_ID_OFST                12
+#define MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST           16
+#define MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN            4
+#define MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_UCAST_DST_LBN 31
+#define MC_CMD_FILTER_OP_IN_RX_DEST_OFST                20
+#define MC_CMD_FILTER_OP_IN_RX_DEST_HOST                0x1
+#define MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST               24
+#define MC_CMD_FILTER_OP_IN_RX_MODE_OFST                28
+#define MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE             0x0
+#define MC_CMD_FILTER_OP_IN_TX_DEST_OFST                40
+#define MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT     0xffffffffu
+#define MC_CMD_FILTER_OP_IN_DST_MAC_OFST                52
+#define MC_CMD_FILTER_OP_IN_DST_MAC_LEN                  6
+
+#define MC_CMD_FILTER_OP_OUT_LEN                        12
+#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST              4
+#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST              8
+#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID  0xffffffffu
+#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID  0xffffffffu
+
 #define MC_CMD_GET_CAPABILITIES           0xbe
 #define MC_CMD_GET_CAPABILITIES_OUT_LEN   20
 #define MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST 0
@@ -1519,6 +1556,122 @@ sfc7120_mcdi_vadaptor_free(sfc7120_softc_t *sc)
         device_printf(sc->dev, "MCDI VADAPTOR_FREE failed: %d\n", rc);
     }
     sc->vadaptor_allocated = false;
+    return rc;
+}
+
+int
+sfc7120_mcdi_filter_insert(sfc7120_softc_t *sc)
+{
+    if (sc->rx_filter_inserted)
+        return 0;
+
+    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN]   = {0};
+    uint8_t  resp[MC_CMD_FILTER_OP_OUT_LEN] = {0};
+    size_t   used = 0;
+    uint32_t match;
+    uint32_t handle_lo, handle_hi;
+    int      rc;
+
+    /*
+     * First filter for the port-to-port loopback bridge: match RX frames
+     * whose destination MAC equals this port's MAC and steer them to RX
+     * queue 0. The userspace bridge TXes with dst = the peer port's MAC, so
+     * an exact DST_MAC filter on each PF catches the bridged unicast traffic.
+     *
+     * Promiscuous fallback (not used here): drop the DST_MAC match and set
+     * MATCH_UNKNOWN_UCAST_DST (LBN 31) instead, with no DST_MAC value — that
+     * receives all unicast not claimed by a more specific filter, useful if
+     * the bridge doesn't rewrite destination MACs.
+     */
+    match = (1u << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN);
+
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
+        MC_CMD_FILTER_OP_IN_OP_INSERT;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_PORT_ID_OFST) =
+        EVB_PORT_ID_ASSIGNED;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST) = match;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_DEST_OFST) =
+        MC_CMD_FILTER_OP_IN_RX_DEST_HOST;
+    /* RX_QUEUE is the function-local RX queue index (matches our
+     * init_rxq(instance=0)), NOT the absolute vi_base. */
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST) = 0;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_MODE_OFST) =
+        MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_TX_DEST_OFST) =
+        MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT;
+
+    /*
+     * NOTE: unlike every other MCDI field, filter match VALUES go on the wire
+     * in network (big-endian) byte order. sc->mac_addr is already in network
+     * order, so it is memcpy'd as-is (mirrors sfxge ef10_filter.c
+     * efx_mcdi_filter_op_add). The dword fields set above are ordinary
+     * little-endian MCDI integers.
+     */
+    memcpy(buf + MC_CMD_FILTER_OP_IN_DST_MAC_OFST, sc->mac_addr,
+           MC_CMD_FILTER_OP_IN_DST_MAC_LEN);
+
+    /* Opcode 0x8a >= 0x80 → exec auto-selects v2 framing. IN_LEN=108 is
+     * dword-aligned; no alignment check needed (and per CLAUDE.md "quirks"
+     * must never be added). If a future fw rejects the base layout with
+     * EINVAL, resend with EXT_IN (172, zero-padded) — sfxge sends V3_IN. */
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
+                           buf, sizeof(buf), resp, sizeof(resp), &used);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FILTER_OP(INSERT) failed: %d\n", rc);
+        return rc;
+    }
+    if (used < MC_CMD_FILTER_OP_OUT_LEN) {
+        device_printf(sc->dev,
+            "MCDI FILTER_OP(INSERT): short response (%zu bytes)\n", used);
+        return EPROTO;
+    }
+
+    /* exec already le32toh'd each response dword, so resp holds native
+     * integers — no further byte-swap (mirrors alloc_vis / get_link). */
+    memcpy(&handle_lo, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST], 4);
+    memcpy(&handle_hi, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST], 4);
+
+    if (handle_lo == MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID &&
+        handle_hi == MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID) {
+        device_printf(sc->dev,
+            "MCDI FILTER_OP(INSERT): firmware returned invalid handle\n");
+        return EIO;
+    }
+
+    sc->rx_filter_handle =
+        ((uint64_t)handle_hi << 32) | (uint64_t)handle_lo;
+    sc->rx_filter_inserted = true;
+    device_printf(sc->dev,
+        "MC FILTER_OP: inserted handle=0x%016jx (dst_mac match -> rxq 0)\n",
+        (uintmax_t)sc->rx_filter_handle);
+    return 0;
+}
+
+int
+sfc7120_mcdi_filter_remove(sfc7120_softc_t *sc)
+{
+    if (!sc->rx_filter_inserted)
+        return 0;
+
+    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN] = {0};
+    uint32_t handle_lo = (uint32_t)(sc->rx_filter_handle & 0xffffffffu);
+    uint32_t handle_hi = (uint32_t)(sc->rx_filter_handle >> 32);
+    int      rc;
+
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
+        MC_CMD_FILTER_OP_IN_OP_REMOVE;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST) = handle_lo;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST) = handle_hi;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
+                           buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FILTER_OP(REMOVE) failed: %d\n", rc);
+        /* Clear the flag anyway — after an MC reboot / ENTITY_RESET the
+         * firmware has already dropped the filter, and repeating REMOVE on a
+         * stale handle is unsafe. */
+    }
+    sc->rx_filter_inserted = false;
     return rc;
 }
 

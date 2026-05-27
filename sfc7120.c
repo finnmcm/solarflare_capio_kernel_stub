@@ -60,6 +60,20 @@ static void sfc7120_interrupt_handler(void *arg);
 static void sfc7120_rx_task_handler(void *context, int pending);
 static int  sfc7120_intr_setup(sfc7120_softc_t *sc);
 static void sfc7120_intr_teardown(sfc7120_softc_t *sc);
+static void sfc7120_rx_post_initial(sfc7120_softc_t *sc);
+
+/* EF10 RX prefix: 14-byte pseudo-header prepended when INIT_RXQ FLAG_PREFIX
+ * is set (our flags=0x300 includes bit 8).  Layout per ef10_rx.c:737:
+ *   +0x00  hash32 (LE)
+ *   +0x04  outer VLAN (BE)
+ *   +0x06  inner VLAN (BE)
+ *   +0x08  packet length (LE, excl. prefix; 0 = cut-through mode)
+ *   +0x0a  MAC timestamp (LE) */
+#define SFC7120_EF10_RX_PREFIX_LEN  14
+
+/* EF10 RX write-pointer alignment requirement (EF10_RX_WPTR_ALIGN in
+ * ef10_impl.h).  The RX doorbell wptr must be a multiple of this. */
+#define SFC7120_RX_WPTR_ALIGN       8
 
 #define SFC7120_LOCK_INIT(sc) \
     mtx_init(&(sc)->sc_mtx, device_get_nameunit((sc)->dev), \
@@ -302,6 +316,49 @@ sfc7120_free_dma_resources(sfc7120_softc_t *sc)
 }
 
 /* ---------------------------------------------------------------------- */
+/* RX descriptor ring initialisation                                       */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Post (SFC7120_NUM_RX_DESC - SFC7120_RX_WPTR_ALIGN) = 504 descriptors so
+ * the NIC has a deep supply of buffers on first attach.  We intentionally stop
+ * one alignment batch short of a full ring so the initial wptr is 504 (not 0)
+ * — a wptr of 0 after INIT_RXQ could be ambiguous.
+ *
+ * Each descriptor is an 8-byte little-endian qword:
+ *   bits[47:0]  = physical buffer address (48-bit)
+ *   bits[61:48] = buffer byte count (14-bit; BYTE_CNT field)
+ *   bits[63:62] = RESERVED (0)
+ * (ESF_DZ_RX_KER_* in efx_regs_ef10.h; ef10_rx.c:ef10_rx_qpost.)
+ *
+ * The wptr is written to SFC7120_REG_RX_DESC_DBL (ER_DZ_RX_DESC_UPD_REG_OFST
+ * = 0x0830, function-local VI 0), value = produced & (ring_size - 1).
+ * EF10 requires this to be aligned to EF10_RX_WPTR_ALIGN (8).
+ */
+static void
+sfc7120_rx_post_initial(sfc7120_softc_t *sc)
+{
+    uint64_t *ring = (uint64_t *)sc->rx_desc_ring;
+    int n = SFC7120_NUM_RX_DESC - SFC7120_RX_WPTR_ALIGN; /* 504 */
+
+    for (int i = 0; i < n; i++) {
+        bus_addr_t paddr = sc->rx_buffer_paddr +
+                           (bus_addr_t)i * SFC7120_RX_BUFFER_SIZE;
+        uint64_t desc = (paddr & 0x0000ffffffffffffULL) |
+                        ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48);
+        ring[i] = htole64(desc);
+    }
+    bus_dmamap_sync(sc->rx_desc_dtag, sc->rx_desc_dmamap, BUS_DMASYNC_PREWRITE);
+
+    sc->rx_pushed = n;
+    /* wptr must be aligned to SFC7120_RX_WPTR_ALIGN; n=504 is already aligned. */
+    uint32_t wptr = (uint32_t)(n & (SFC7120_NUM_RX_DESC - 1)); /* 504 */
+    SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL, wptr);
+    device_printf(sc->dev,
+        "RX: posted %d initial descriptors, wptr=%u\n", n, wptr);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Hardware bringup. Stops here at MCDI + identity queries — EVQ/RXQ/TXQ  */
 /* init needs DMA rings, so it lives in a future sfc7120_hw_start() that  */
 /* runs after sfc7120_alloc_dma_resources(). The MCDI plumbing itself is  */
@@ -445,6 +502,10 @@ sfc7120_hw_teardown(sfc7120_softc_t *sc)
      * (firmware returns EBUSY otherwise — RX/TX queues hold a reference to
      * their target EVQ). VADAPTOR_FREE must happen before FREE_VIS. */
     (void)sfc7120_mcdi_fini_txq(sc, 0);
+    /* Remove the RX filter before tearing down RXQ 0 it points at — the
+     * filter references the RX queue, so it must go first. Self-guards on
+     * sc->rx_filter_inserted, so this is a no-op if insert never ran. */
+    (void)sfc7120_mcdi_filter_remove(sc);
     (void)sfc7120_mcdi_fini_rxq(sc, 0);
     (void)sfc7120_mcdi_fini_evq(sc, 0);
     (void)sfc7120_mcdi_vadaptor_free(sc);
@@ -569,6 +630,32 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: init_txq done\n");
 
+    /* INSERT RX FILTER. RXQ 0 must already exist (above) — the filter names
+     * RX queue 0 as its destination. Without a filter the MC drops every RX
+     * frame before it reaches the ring, so this is the last blocker for RX
+     * delivery. Treated like the other queue-init steps: log and bail to
+     * fail_dma on error rather than half-attaching. */
+    device_printf(dev, "TRACE: calling filter_insert\n");
+    error = sfc7120_mcdi_filter_insert(sc);
+    if (error != 0) {
+        device_printf(dev, "filter_insert failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: filter_insert done\n");
+
+    /* Initialize TX ring counters before posting any descriptors.
+     * tx_descriptors_free MUST be set; it defaults to 0 from the zero-init
+     * softc which would block all transmits. */
+    sc->tx_head             = 0;
+    sc->tx_tail             = 0;
+    sc->tx_descriptors_free = SFC7120_NUM_TX_DESC;
+    sc->rx_head             = 0;
+    sc->rx_pending_slot     = 0;
+    sc->rx_event_bytes      = 0;
+
+    /* Post the initial RX descriptor batch so the NIC has buffers ready.
+     * Sets sc->rx_pushed — must come AFTER the zeroing above. */
+    sfc7120_rx_post_initial(sc);
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */
@@ -767,14 +854,183 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         SFC7120_UNLOCK(sc);
         return 0;
     }
-    case SFC7120_TX:
-        /* TODO: validate user cap (tag/perm/length) and copyin into the
-         * TX descriptor ring. See e1000_fbsd_raw_transmit() for the
-         * cheri_gettag / cheri_getperm / cheri_getlen pattern. */
-        return ENOSYS;
-    case SFC7120_RX:
-        /* TODO: copyout received packets. */
-        return ENOSYS;
+    case SFC7120_TX: {
+        sfc7120_tx_req_t *req = (sfc7120_tx_req_t *)data;
+
+        /* Validate the user CHERI capability (tag + LOAD permission + bounds).
+         * Mirrors e1000pol.c:1314-1326. */
+        if (!cheri_gettag(req->tx_buf_addr)) {
+            device_printf(sc->dev, "TX: invalid capability tag\n");
+            return EINVAL;
+        }
+        if (!(cheri_getperm(req->tx_buf_addr) & CHERI_PERM_LOAD)) {
+            device_printf(sc->dev, "TX: no LOAD permission on cap\n");
+            return EACCES;
+        }
+        if (req->length == 0 || req->length > SFC7120_TX_BUFFER_SIZE) {
+            device_printf(sc->dev, "TX: bad length %zu\n", req->length);
+            return EINVAL;
+        }
+
+        SFC7120_LOCK(sc);
+
+        if (sc->tx_descriptors_free == 0) {
+            SFC7120_UNLOCK(sc);
+            return ENOBUFS;
+        }
+
+        int tail = sc->tx_tail;
+        uint8_t *kbuf = (uint8_t *)sc->tx_buffer +
+                        (size_t)tail * SFC7120_TX_BUFFER_SIZE;
+        bus_addr_t paddr = sc->tx_buffer_paddr +
+                           (bus_addr_t)tail * SFC7120_TX_BUFFER_SIZE;
+
+        int error = copyin(req->tx_buf_addr, kbuf, req->length);
+        if (error != 0) {
+            SFC7120_UNLOCK(sc);
+            device_printf(sc->dev, "TX: copyin failed: %d\n", error);
+            return error;
+        }
+        bus_dmamap_sync(sc->tx_buffer_dtag, sc->tx_buffer_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        /* Build the 8-byte EF10 TX kernel descriptor.
+         *   bits[47:0]  = BUF_ADDR  (48-bit physical address)
+         *   bits[61:48] = BYTE_CNT  (14-bit byte count)
+         *   bit [62]    = CONT=0    (last/only segment)
+         *   bit [63]    = TYPE=0    (kernel descriptor, not option)
+         * (ESF_DZ_TX_KER_* in efx_regs_ef10.h.) */
+        uint64_t *ring = (uint64_t *)sc->tx_desc_ring;
+        uint64_t desc = (paddr & 0x0000ffffffffffffULL) |
+                        ((uint64_t)(req->length & 0x3fff) << 48);
+        ring[tail] = htole64(desc);
+        bus_dmamap_sync(sc->tx_desc_dtag, sc->tx_desc_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        sc->tx_descriptors_free--;
+        sc->tx_tail = (tail + 1) & (SFC7120_NUM_TX_DESC - 1);
+
+        /* Push TX write pointer via the WRITED2 path.
+         * ERF_DZ_TX_DESC_WPTR lives at LBN=64 (dword[2]) of TX_DESC_UPD.
+         * EFX_BAR_VI_WRITED2 adds 2*sizeof(dword)=8 to the base offset, so
+         * we write to SFC7120_REG_TX_WPTR_DBL = 0x0a10 + 8 = 0x0a18.
+         * Value = new wptr (12-bit), no VLD bit. */
+        uint32_t wptr = (uint32_t)sc->tx_tail & 0xfffu;
+        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_WPTR_DBL, wptr);
+
+        device_printf(sc->dev,
+            "TX: slot=%d len=%zu paddr=0x%lx wptr=%u free_left=%d\n",
+            tail, req->length, (unsigned long)paddr, wptr,
+            sc->tx_descriptors_free);
+
+        req->status = 0;
+        SFC7120_UNLOCK(sc);
+        return 0;
+    }
+
+    case SFC7120_RX: {
+        sfc7120_rx_req_t *req = (sfc7120_rx_req_t *)data;
+
+        /* Wait for an RX frame.  The ISR (via rx_task_handler) sets
+         * rx_received and calls wakeup(&sc->rx_received).  Block up to 5 s.
+         * Lock order: rx_mtx only here; sc_mtx acquired separately below for
+         * the descriptor refill to avoid rx_mtx -> sc_mtx inversion. */
+        SFC7120_RX_LOCK(sc);
+        for (int i = 0; i < 5 && !sc->rx_received && !sc->dying; i++) {
+            int ret = msleep(sc, &sc->rx_mtx,
+                             PZERO | PCATCH, "sfc7120rx", hz);
+            if (ret == EINTR || ret == ERESTART) {
+                SFC7120_RX_UNLOCK(sc);
+                return EINTR;
+            }
+        }
+        if (!sc->rx_received) {
+            SFC7120_RX_UNLOCK(sc);
+            return ETIMEDOUT;
+        }
+
+        /* Snapshot the pending-frame state and clear the flag. */
+        int slot         = sc->rx_pending_slot;
+        uint32_t rbytes  = sc->rx_event_bytes;
+        sc->rx_received  = false;
+        SFC7120_RX_UNLOCK(sc);
+
+        /* Sync the RX buffer for CPU reads. */
+        bus_dmamap_sync(sc->rx_buffer_dtag, sc->rx_buffer_dmamap,
+                        BUS_DMASYNC_POSTREAD);
+
+        /* Decode the 14-byte EF10 prefix (ef10_rx.c:737).
+         * Prefix offset +8 holds the frame length (LE uint16, excl. prefix).
+         * If 0, firmware was in cut-through mode — use event bytes instead. */
+        uint8_t *rxbuf = (uint8_t *)sc->rx_buffer +
+                         (size_t)slot * SFC7120_RX_BUFFER_SIZE;
+        uint16_t plen = (uint16_t)rxbuf[8] | ((uint16_t)rxbuf[9] << 8);
+        if (plen == 0) {
+            /* Cut-through mode: derive length from event bytes minus prefix. */
+            plen = (rbytes > SFC7120_EF10_RX_PREFIX_LEN)
+                   ? (uint16_t)(rbytes - SFC7120_EF10_RX_PREFIX_LEN)
+                   : 0;
+        }
+
+        device_printf(sc->dev,
+            "RX: slot=%d rbytes=%u plen=%u\n", slot, rbytes, (unsigned)plen);
+
+        if (plen == 0 ||
+            plen > SFC7120_RX_BUFFER_SIZE - SFC7120_EF10_RX_PREFIX_LEN) {
+            req->status = 1;
+            req->error  = 1;
+            req->length_received = 0;
+            return EINVAL;
+        }
+
+        /* Copyout the frame data (past the prefix) into the caller's buffer. */
+        uint8_t *frame = rxbuf + SFC7120_EF10_RX_PREFIX_LEN;
+        int error = copyout(frame, req->raw_buffer, plen);
+        if (error != 0) {
+            device_printf(sc->dev, "RX: copyout failed: %d\n", error);
+            req->status = 1;
+            req->error  = 1;
+            return error;
+        }
+
+        req->descriptors[0].start_ptr  = req->raw_buffer;
+        req->descriptors[0].length     = plen;
+        req->descriptor_length         = 1;
+        req->length_received           = plen;
+        req->status                    = 0;
+        req->error                     = 0;
+
+        /* Refill the consumed slot and advance the producer pointer.
+         * We post the next ring slot (rx_pushed % ring_size) with the
+         * corresponding physical buffer.  The wptr doorbell is written only
+         * when the new producer value is aligned to SFC7120_RX_WPTR_ALIGN. */
+        SFC7120_LOCK(sc);
+        int slot_to_post = sc->rx_pushed & (SFC7120_NUM_RX_DESC - 1);
+        bus_addr_t rpaddr = sc->rx_buffer_paddr +
+                            (bus_addr_t)slot_to_post * SFC7120_RX_BUFFER_SIZE;
+        uint64_t *rring = (uint64_t *)sc->rx_desc_ring;
+        uint64_t rdesc = (rpaddr & 0x0000ffffffffffffULL) |
+                         ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48);
+        rring[slot_to_post] = htole64(rdesc);
+        bus_dmamap_sync(sc->rx_desc_dtag, sc->rx_desc_dmamap,
+                        BUS_DMASYNC_PREWRITE);
+
+        sc->rx_pushed++;
+        /* Push doorbell only on aligned boundaries to satisfy EF10 requirement.
+         * Unaligned pushes are silently ignored; aligning avoids hardware-side
+         * surprises but wastes at most (SFC7120_RX_WPTR_ALIGN - 1) slots. */
+        if ((sc->rx_pushed & (SFC7120_RX_WPTR_ALIGN - 1)) == 0) {
+            uint32_t rwptr = (uint32_t)(sc->rx_pushed &
+                                        (SFC7120_NUM_RX_DESC - 1));
+            SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL, rwptr);
+            device_printf(sc->dev,
+                "RX refill: slot_posted=%d rx_pushed=%d wptr=%u\n",
+                slot_to_post, sc->rx_pushed, rwptr);
+        }
+        SFC7120_UNLOCK(sc);
+
+        return 0;
+    }
     default:
         return ENOTTY;
     }
@@ -893,12 +1149,37 @@ sfc7120_interrupt_handler(void *arg)
             device_printf(sc->dev, "EVQ DRIVER_EV: %#016jx\n",
                           (uintmax_t)ev);
             break;
-        case SFC7120_EV_CODE_RX:
+        case SFC7120_EV_CODE_RX: {
+            /* ESF_DZ_RX_BYTES: LBN=0 WIDTH=14 — byte count including the
+             * 14-byte EF10 prefix (FLAG_PREFIX was set in INIT_RXQ flags). */
+            uint32_t rbytes = lo & 0x3fffu;
+            device_printf(sc->dev,
+                "EVQ RX_EV: bytes=%u slot=%d\n", rbytes, sc->rx_head);
+            sc->rx_event_bytes  = rbytes;
+            sc->rx_pending_slot = sc->rx_head;
+            sc->rx_head = (sc->rx_head + 1) & (SFC7120_NUM_RX_DESC - 1);
             wake_rx_task = true;
             break;
-        case SFC7120_EV_CODE_TX:
-            /* TODO: TX completion reaping. */
+        }
+        case SFC7120_EV_CODE_TX: {
+            /* ESF_DZ_TX_DESCR_INDX: LBN=0 WIDTH=16 — index of the last TX
+             * descriptor completed by the NIC. */
+            uint32_t descr_indx = lo & 0xffffu;
+            int new_head = ((int)descr_indx + 1) & (SFC7120_NUM_TX_DESC - 1);
+            /* Credit back descriptors between tx_head and new_head (wrap-safe). */
+            int freed = (new_head - sc->tx_head + SFC7120_NUM_TX_DESC)
+                        & (SFC7120_NUM_TX_DESC - 1);
+            if (freed == 0)
+                freed = 1; /* single-descriptor batch always frees one */
+            sc->tx_head = new_head;
+            sc->tx_descriptors_free += freed;
+            if (sc->tx_descriptors_free > SFC7120_NUM_TX_DESC)
+                sc->tx_descriptors_free = SFC7120_NUM_TX_DESC;
+            device_printf(sc->dev,
+                "EVQ TX_EV: descr_indx=%u new_head=%d freed=%d free_now=%d\n",
+                descr_indx, new_head, freed, sc->tx_descriptors_free);
             break;
+        }
         default:
             device_printf(sc->dev,
                 "EVQ unknown code=%#x ev=%#016jx\n",
@@ -942,6 +1223,7 @@ sfc7120_rx_task_handler(void *context, int pending)
     sfc7120_softc_t *sc = (sfc7120_softc_t *)context;
     SFC7120_RX_LOCK(sc);
     sc->rx_received = true;
+    wakeup(sc);                   /* wake SFC7120_RX msleep() callers */
     selwakeuppri(&sc->selinfo, PZERO + 1);
     SFC7120_RX_UNLOCK(sc);
 }

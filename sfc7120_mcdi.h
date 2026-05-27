@@ -77,6 +77,13 @@ int  sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance);
 int sfc7120_mcdi_vadaptor_alloc(sfc7120_softc_t *sc);
 int sfc7120_mcdi_vadaptor_free(sfc7120_softc_t *sc);
 
+/* RX filter insert/remove (MC_CMD_FILTER_OP). insert steers matching RX
+ * traffic to RX queue 0 and caches the returned handle in
+ * sc->rx_filter_handle; remove tears it down using that handle. Without a
+ * filter the MC drops all RX frames before they reach RXQ 0. */
+int sfc7120_mcdi_filter_insert(sfc7120_softc_t *sc);
+int sfc7120_mcdi_filter_remove(sfc7120_softc_t *sc);
+
 int sfc7120_mcdi_init_rxq(sfc7120_softc_t *sc, uint32_t instance, uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs);
 int sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance, uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs);
 
