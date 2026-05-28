@@ -39,6 +39,7 @@
 #include <cheri/cheri.h>
 
 #include "capio.h"
+#include "sfc7120_uapi.h"
 
 /*
  * Solarflare SFN7000-series (Huntington / EF10) is event-driven, not
@@ -288,10 +289,6 @@ typedef struct sfc7120_softc {
     bool                debug_reg_ops;
 } sfc7120_softc_t;
 
-/* Driver-specific IOCTLs.
- *   'S' picks a non-conflicting group letter (E1000 uses 'E', CAPIO 'C'). */
-#define SFC7120_RX          _IOWR('S', 1, sfc7120_rx_req_t)
-#define SFC7120_TX          _IOWR('S', 2, sfc7120_tx_req_t)
-#define SFC7120_GET_MAC     _IOWR('S', 3, sfc7120_mac_req_t)
+/* IOCTLs defined in sfc7120_uapi.h (SFC7120_RX, SFC7120_TX, SFC7120_GET_MAC). */
 
 #endif /* SFC7120_POL_H */

@@ -1,24 +1,30 @@
-# CheriBsdSolarflare7120 — Solarflare 7120 CAPIO Kernel Driver
+# CheriBsdSolarflare7120 — Solarflare 7120 CAPIO Kernel Driver + Userspace Library
 
 ## Status (2026-05-26)
 
-Both PFs reach `LINK_UP @ 10 GbE` with SFP+ DAC loopback. MSI-X vector
-allocated, ISR registered. EVQ/RXQ/TXQ initialized (512 entries each).
-Exact-DST_MAC RX filter inserted on each PF and confirmed on hardware.
+Out-of-tree workspace for the Solarflare SFN7000-series (Huntington / EF10)
+CAPIO driver stack. Contains two components that live together in this repo:
+
+- **Kernel module** (`sfc7120pol.ko`) — PCI driver, MCDI firmware transport,
+  queue init, CAPIO wiring. Cross-compile via bmake on Linux, native make on
+  CheriBSD. Modeled on `~/CheriBsdE1000/` for the kernel conventions.
+- **Userspace library** (`userlib/sfc7120_user.c`) — hand-rolled
+  Ethernet/IP/UDP driver that opens `/dev/sfc7120pol`, attaches via CAPIO,
+  and communicates directly with the NIC through mmapped DMA buffers and MMIO
+  register slices. No lwIP dependency. Phase 1 drives TX/RX through ioctls;
+  phase 3 removes the kernel from the data path entirely via direct EVQ
+  polling.
 
 **TODO:** EVQ event delivery unexercised on hardware (no `EVQ ...` dmesg
 line yet — no traffic, link was already up at attach). TX-completion reaping;
 TX/RX IOCTL bodies; in-tree copy; userspace driver.
 
----
 
 ## Reference Reading (Required)
 
 Before modifying anything here, read:
 1. `~/CheriBsdE1000/CLAUDE.md` — first CAPIO driver, simpler reference
 2. `~/cheri/cheribsd/sys/modules/mlx5pol/CLAUDE.md` — closest pattern for EF10 MCDI
-
----
 
 ## Hardware Target
 
@@ -159,12 +165,18 @@ early interrupt is harmless (ISR bails on `!evq_initialized`).
 
 ## Role in the Larger System
 
-```
-Userspace (E1000Lwip/netif/sfc7120_driver.c — TODO)
-  open("/dev/sfc7120pol") → ioctl(CAPIO_ATTACH) → kernel seals CHERI cap
-  mmap(TX_BUFFER / RX_BUFFER / MMIO_REGION) → bounded VM objects
-  TX/RX via descriptor rings + doorbells (no syscalls in data path)
-```
+Userspace (userlib/sfc7120_user.c — IN PROGRESS)
+  │  open("/dev/sfc7120pol")
+  │  ioctl(CAPIO_ATTACH)          ──────► Kernel (this module)
+  │                                         seals userspace cap
+  │◄── returns sealed CHERI capability ────
+  │
+  │  mmap(SFC7120_TX_BUFFER /     ──────► capio_mmap_single_extra()
+  │       SFC7120_RX_BUFFER /                validates token, builds
+  │       SFC7120_MMIO_REGION)                bounded VM object
+  │◄── userspace VA backed by NIC DMA/MMIO
+  │
+  │  TX/RX: write descriptor ring + ring doorbell (no syscalls)
 
 Port 0 (PF0) and port 1 (PF1) are cabled via SFP+ DAC — frames TX'd on one port
 ingress the other. Both PFs must be open simultaneously; userspace bridges between them.
@@ -240,7 +252,6 @@ before exposing to userspace. Wrong offsets → CHERI bounds violation in usersp
 | In-tree copy | Not yet | `~/cheri/cheribsd/sys/modules/sfc7120pol/` |
 | Userspace driver | Not yet | `~/E1000Lwip/netif/sfc7120_driver.c` |
 
----
 
 ## Next Steps
 
@@ -275,5 +286,6 @@ Dependencies: `modmap.ko` must load first. `kldunload sfxge` if loaded.
 
 | Vendor | Device ID | Description |
 |---|---|---|
+<<<<<<< HEAD
 | 0x1924 | 0x0903 | Solarflare SFC9120 10G (EF10) PF |
 | 0x1924 | 0x1903 | Solarflare SFC9120 10G (EF10) VF |
