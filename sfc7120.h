@@ -184,7 +184,6 @@ typedef struct sfc7120_softc {
     int                 tx_descriptors_free;
 
     /* RX resources */
-    volatile bool       rx_received;
     volatile bool       rx_teardown;
     struct task         rx_task;
     struct taskqueue   *rx_taskqueue;
@@ -202,16 +201,23 @@ typedef struct sfc7120_softc {
     bus_dma_tag_t       rx_buffer_dtag;
     bus_dmamap_t        rx_buffer_dmamap;
     bool                rx_buffer_mapped;
-    int                 rx_head;
-    /* Pending-frame state: set by ISR (sc_mtx held), consumed by SFC7120_RX. */
-    int                 rx_pending_slot;   /* ring slot of last received frame */
-    uint32_t            rx_event_bytes;    /* bytes from last RX event (prefix+frame) */
+    /* RX completion SPSC ring (producer = ISR, consumer = SFC7120_RX ioctl).
+     * Both indices and the per-slot bytes array are governed by rx_mtx.
+     * Empty <=> rx_completion_tail == rx_head. */
+    int                 rx_head;           /* producer: ISR advances on RX_EV */
+    int                 rx_completion_tail;/* consumer: ioctl advances on read */
+    uint16_t            rx_event_bytes_ring[SFC7120_NUM_RX_DESC];
     int                 rx_pushed;         /* un-masked producer counter for wptr guard */
 
     /* Lifecycle */
     bool                device_attached;
     struct cdev        *cdev;
     struct mtx          sc_mtx;
+    /* Serializes TX ioctl submitters end-to-end (reserve → copyin → publish
+     * → doorbell) so the descriptor ring is written in reserve order even
+     * when copyin page-faults.  ISR does NOT take this lock — it can credit
+     * TX completions while a submitter is in copyin. */
+    struct mtx          tx_submit_mtx;
     bool                dying;
     bool                mapped;
 

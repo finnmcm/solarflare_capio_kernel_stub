@@ -89,6 +89,15 @@ static void sfc7120_rx_post_initial(sfc7120_softc_t *sc);
 #define SFC7120_RX_UNLOCK(sc)       mtx_unlock(&(sc)->rx_mtx)
 #define SFC7120_RX_LOCK_DESTROY(sc) mtx_destroy(&(sc)->rx_mtx)
 
+/* TX submitter lock — see sfc7120.h.  Lock order: tx_submit_mtx (outer) →
+ * sc_mtx (inner) for counter R/M/W only.  Never nested with rx_mtx. */
+#define SFC7120_TX_SUBMIT_LOCK_INIT(sc) \
+    mtx_init(&(sc)->tx_submit_mtx, device_get_nameunit((sc)->dev), \
+             "sfc7120 tx submit lock", MTX_DEF)
+#define SFC7120_TX_SUBMIT_LOCK(sc)         mtx_lock(&(sc)->tx_submit_mtx)
+#define SFC7120_TX_SUBMIT_UNLOCK(sc)       mtx_unlock(&(sc)->tx_submit_mtx)
+#define SFC7120_TX_SUBMIT_LOCK_DESTROY(sc) mtx_destroy(&(sc)->tx_submit_mtx)
+
 /*
  * Solarflare PCI device IDs.
  *
@@ -549,6 +558,7 @@ sfc7120_fbsd_attach(device_t dev)
     //finn: sc_mtx : main device lock, protects fields touched by multiple contexts. mutex taken by any thread that wants to use shared fields
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
+    SFC7120_TX_SUBMIT_LOCK_INIT(sc);
 
     /* 1. Allocate BAR2 (function MMIO window). */
     device_printf(dev, "TRACE: about to alloc BAR2\n");
@@ -650,8 +660,8 @@ sfc7120_fbsd_attach(device_t dev)
     sc->tx_tail             = 0;
     sc->tx_descriptors_free = SFC7120_NUM_TX_DESC;
     sc->rx_head             = 0;
-    sc->rx_pending_slot     = 0;
-    sc->rx_event_bytes      = 0;
+    sc->rx_completion_tail  = 0;
+    /* rx_event_bytes_ring[] left zeroed by softc M_ZERO alloc. */
 
     /* Post the initial RX descriptor batch so the NIC has buffers ready.
      * Sets sc->rx_pushed — must come AFTER the zeroing above. */
@@ -738,6 +748,7 @@ fail_bar:
     pci_disable_busmaster(dev);
     bus_release_resource(dev, SYS_RES_MEMORY, sc->mem_res_id, sc->mem_resource);
 fail_lock:
+    SFC7120_TX_SUBMIT_LOCK_DESTROY(sc);
     SFC7120_RX_LOCK_DESTROY(sc);
     SFC7120_LOCK_DESTROY(sc);
     return error;
@@ -792,6 +803,7 @@ sfc7120_fbsd_detach(device_t dev)
      * initialized by init_capio_sc. */
     capio_destroy(sc);
 
+    SFC7120_TX_SUBMIT_LOCK_DESTROY(sc);
     SFC7120_RX_LOCK_DESTROY(sc);
     SFC7120_LOCK_DESTROY(sc);
     return 0;
@@ -826,7 +838,7 @@ sfc7120_poll(struct cdev *dev, int events, struct thread *td)
         return POLLERR;
 
     SFC7120_RX_LOCK(sc);
-    if (sc->rx_received)
+    if (sc->rx_completion_tail != sc->rx_head)
         revents |= events & (POLLIN | POLLRDNORM);
     else
         selrecord(td, &sc->selinfo);
@@ -872,22 +884,43 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             return EINVAL;
         }
 
-        SFC7120_LOCK(sc);
+        /* tx_submit_mtx serializes us against other TX submitters so the
+         * descriptor ring is written in reserve order and the doorbell wptr
+         * matches.  The ISR does NOT take tx_submit_mtx, so it can credit
+         * back TX completions while we are mid-copyin. */
+        SFC7120_TX_SUBMIT_LOCK(sc);
 
+        /* Reserve a slot.  sc_mtx held only across the counter R/M/W
+         * because the ISR also touches tx_descriptors_free / tx_head. */
+        SFC7120_LOCK(sc);
         if (sc->tx_descriptors_free == 0) {
             SFC7120_UNLOCK(sc);
+            SFC7120_TX_SUBMIT_UNLOCK(sc);
             return ENOBUFS;
         }
-
         int tail = sc->tx_tail;
+        int new_tail = (tail + 1) & (SFC7120_NUM_TX_DESC - 1);
+        sc->tx_descriptors_free--;
+        sc->tx_tail = new_tail;
+        SFC7120_UNLOCK(sc);
+
         uint8_t *kbuf = (uint8_t *)sc->tx_buffer +
                         (size_t)tail * SFC7120_TX_BUFFER_SIZE;
         bus_addr_t paddr = sc->tx_buffer_paddr +
                            (bus_addr_t)tail * SFC7120_TX_BUFFER_SIZE;
 
+        /* copyin without sc_mtx: a user page-fault here no longer blocks
+         * the ISR.  tx_submit_mtx is still held, so no other submitter
+         * advances past us in the meantime. */
         int error = copyin(req->tx_buf_addr, kbuf, req->length);
         if (error != 0) {
+            /* Roll back the reservation.  tx_submit_mtx held → tx_tail is
+             * still new_tail; safe to restore. */
+            SFC7120_LOCK(sc);
+            sc->tx_tail = tail;
+            sc->tx_descriptors_free++;
             SFC7120_UNLOCK(sc);
+            SFC7120_TX_SUBMIT_UNLOCK(sc);
             device_printf(sc->dev, "TX: copyin failed: %d\n", error);
             return error;
         }
@@ -899,7 +932,9 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          *   bits[61:48] = BYTE_CNT  (14-bit byte count)
          *   bit [62]    = CONT=0    (last/only segment)
          *   bit [63]    = TYPE=0    (kernel descriptor, not option)
-         * (ESF_DZ_TX_KER_* in efx_regs_ef10.h.) */
+         * (ESF_DZ_TX_KER_* in efx_regs_ef10.h.)
+         * No sc_mtx: the ISR never writes the TX descriptor ring, and
+         * tx_submit_mtx serialises us against other submitters. */
         uint64_t *ring = (uint64_t *)sc->tx_desc_ring;
         uint64_t desc = (paddr & 0x0000ffffffffffffULL) |
                         ((uint64_t)(req->length & 0x3fff) << 48);
@@ -907,36 +942,34 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         bus_dmamap_sync(sc->tx_desc_dtag, sc->tx_desc_dmamap,
                         BUS_DMASYNC_PREWRITE);
 
-        sc->tx_descriptors_free--;
-        sc->tx_tail = (tail + 1) & (SFC7120_NUM_TX_DESC - 1);
-
         /* Push TX write pointer via the WRITED2 path.
          * ERF_DZ_TX_DESC_WPTR lives at LBN=64 (dword[2]) of TX_DESC_UPD.
          * EFX_BAR_VI_WRITED2 adds 2*sizeof(dword)=8 to the base offset, so
          * we write to SFC7120_REG_TX_WPTR_DBL = 0x0a10 + 8 = 0x0a18.
          * Value = new wptr (12-bit), no VLD bit. */
-        uint32_t wptr = (uint32_t)sc->tx_tail & 0xfffu;
+        uint32_t wptr = (uint32_t)new_tail & 0xfffu;
         SFC7120_WRITE_REG(sc, SFC7120_REG_TX_WPTR_DBL, wptr);
 
         device_printf(sc->dev,
-            "TX: slot=%d len=%zu paddr=0x%lx wptr=%u free_left=%d\n",
-            tail, req->length, (unsigned long)paddr, wptr,
-            sc->tx_descriptors_free);
+            "TX: slot=%d len=%zu paddr=0x%lx wptr=%u\n",
+            tail, req->length, (unsigned long)paddr, wptr);
 
         req->status = 0;
-        SFC7120_UNLOCK(sc);
+        SFC7120_TX_SUBMIT_UNLOCK(sc);
         return 0;
     }
 
     case SFC7120_RX: {
         sfc7120_rx_req_t *req = (sfc7120_rx_req_t *)data;
 
-        /* Wait for an RX frame.  The ISR (via rx_task_handler) sets
-         * rx_received and calls wakeup(&sc->rx_received).  Block up to 5 s.
+        /* Wait for an RX frame.  The ISR advances rx_head under rx_mtx and
+         * the rx_task_handler issues wakeup(sc); ring-empty <=>
+         * rx_completion_tail == rx_head.  Block up to 5 s.
          * Lock order: rx_mtx only here; sc_mtx acquired separately below for
          * the descriptor refill to avoid rx_mtx -> sc_mtx inversion. */
         SFC7120_RX_LOCK(sc);
-        for (int i = 0; i < 5 && !sc->rx_received && !sc->dying; i++) {
+        for (int i = 0; i < 5 &&
+             sc->rx_completion_tail == sc->rx_head && !sc->dying; i++) {
             int ret = msleep(sc, &sc->rx_mtx,
                              PZERO | PCATCH, "sfc7120rx", hz);
             if (ret == EINTR || ret == ERESTART) {
@@ -944,15 +977,16 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
                 return EINTR;
             }
         }
-        if (!sc->rx_received) {
+        if (sc->rx_completion_tail == sc->rx_head) {
             SFC7120_RX_UNLOCK(sc);
             return ETIMEDOUT;
         }
 
-        /* Snapshot the pending-frame state and clear the flag. */
-        int slot         = sc->rx_pending_slot;
-        uint32_t rbytes  = sc->rx_event_bytes;
-        sc->rx_received  = false;
+        /* Pop one entry from the completion ring. */
+        int slot         = sc->rx_completion_tail;
+        uint32_t rbytes  = sc->rx_event_bytes_ring[slot];
+        sc->rx_completion_tail =
+            (slot + 1) & (SFC7120_NUM_RX_DESC - 1);
         SFC7120_RX_UNLOCK(sc);
 
         /* Sync the RX buffer for CPU reads. */
@@ -1150,11 +1184,17 @@ sfc7120_interrupt_handler(void *arg)
             /* ESF_DZ_RX_BYTES: LBN=0 WIDTH=14 — byte count including the
              * 14-byte EF10 prefix (FLAG_PREFIX was set in INIT_RXQ flags). */
             uint32_t rbytes = lo & 0x3fffu;
+            /* Publish the completion under rx_mtx so the SFC7120_RX
+             * consumer reads bytes and head under the same lock that
+             * ordered the producer's writes.  Lock order sc_mtx → rx_mtx
+             * matches: no other site nests them the other way. */
+            mtx_lock(&sc->rx_mtx);
+            int slot = sc->rx_head;
+            sc->rx_event_bytes_ring[slot] = (uint16_t)rbytes;
+            sc->rx_head = (slot + 1) & (SFC7120_NUM_RX_DESC - 1);
+            mtx_unlock(&sc->rx_mtx);
             device_printf(sc->dev,
-                "EVQ RX_EV: bytes=%u slot=%d\n", rbytes, sc->rx_head);
-            sc->rx_event_bytes  = rbytes;
-            sc->rx_pending_slot = sc->rx_head;
-            sc->rx_head = (sc->rx_head + 1) & (SFC7120_NUM_RX_DESC - 1);
+                "EVQ RX_EV: bytes=%u slot=%d\n", rbytes, slot);
             wake_rx_task = true;
             break;
         }
@@ -1218,8 +1258,11 @@ static void
 sfc7120_rx_task_handler(void *context, int pending)
 {
     sfc7120_softc_t *sc = (sfc7120_softc_t *)context;
+    /* The ring (rx_head vs rx_completion_tail) is the readiness predicate
+     * now — the ISR has already advanced rx_head before enqueueing us.
+     * We just wake any sleeping consumers; they re-check the predicate
+     * under rx_mtx. */
     SFC7120_RX_LOCK(sc);
-    sc->rx_received = true;
     wakeup(sc);                   /* wake SFC7120_RX msleep() callers */
     selwakeuppri(&sc->selinfo, PZERO + 1);
     SFC7120_RX_UNLOCK(sc);
