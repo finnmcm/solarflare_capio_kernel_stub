@@ -993,9 +993,6 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             return error;
         }
 
-        req->descriptors[0].start_ptr  = req->raw_buffer;
-        req->descriptors[0].length     = plen;
-        req->descriptor_length         = 1;
         req->length_received           = plen;
         req->status                    = 0;
         req->error                     = 0;

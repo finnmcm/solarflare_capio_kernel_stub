@@ -84,11 +84,6 @@ typedef struct sfc7120_mac_req {
     uint8_t mac_addr[6];
 } sfc7120_mac_req_t;
 
-typedef struct sfc7120_user_packet_descriptor {
-    uint8_t *start_ptr;
-    size_t   length;
-} sfc7120_user_packet_descriptor_t;
-
 typedef struct sfc7120_tx_req {
     void* __capability user_cap;
     void* __capability sealed_cap;
@@ -98,13 +93,23 @@ typedef struct sfc7120_tx_req {
     uint8_t status;
 } sfc7120_tx_req_t;
 
+/*
+ * RX ioctl request.  Kept deliberately small: the whole received frame lands
+ * in the single contiguous raw_buffer (one 2048-byte RX slot holds an entire
+ * <=1518-byte frame), so no scatter/gather descriptor list is needed.
+ *
+ * NOTE: do NOT embed a large inline array here.  _IOWR's length field is only
+ * 13 bits (IOCPARM_MAX = 8192); a struct over that wraps its encoded length and
+ * kern_ioctl then copies far fewer bytes than the driver writes back -> kernel
+ * stack overflow.  If genuine multi-segment RX is ever needed, add a *pointer*
+ * to a userspace-allocated descriptor array (see e1000 rx_req_t), never an
+ * inline array.
+ */
 typedef struct sfc7120_rx_req {
     void* __capability user_cap;
     void* __capability sealed_cap;
 
     uint8_t *raw_buffer;
-    sfc7120_user_packet_descriptor_t descriptors[SFC7120_NUM_RX_DESC];
-    size_t   descriptor_length;
     size_t   length_received;
 
     uint8_t  status;

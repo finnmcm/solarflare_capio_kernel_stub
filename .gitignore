@@ -60,6 +60,7 @@ core
 test.mk
 test_*.mk
 bsd-xargs
+usertest/sfc7120_test
 
 # Compressed files (if you archive builds)
 *.tar
