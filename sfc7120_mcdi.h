@@ -83,4 +83,17 @@ int sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance, uint32_t targe
 int sfc7120_mcdi_fini_rxq(sfc7120_softc_t *sc, uint32_t instance);
 int sfc7120_mcdi_fini_txq(sfc7120_softc_t *sc, uint32_t instance);
 
+/* MAC / PHY / link bring-up helpers */
+int sfc7120_mcdi_get_phy_cfg(sfc7120_softc_t *sc);
+int sfc7120_mcdi_set_mac(sfc7120_softc_t *sc);
+int sfc7120_mcdi_set_link(sfc7120_softc_t *sc);
+int sfc7120_mcdi_get_link(sfc7120_softc_t *sc);
+
+/* RX filter insert/remove (MC_CMD_FILTER_OP). insert steers matching RX
+ * traffic to RX queue 0 and caches the returned handle in
+ * sc->rx_filter_handle; remove tears it down using that handle. Without a
+ * filter the MC drops all RX frames before they reach RXQ 0. */
+int sfc7120_mcdi_filter_insert(sfc7120_softc_t *sc);
+int sfc7120_mcdi_filter_remove(sfc7120_softc_t *sc);
+
 #endif /* SFC7120_MCDI_H */

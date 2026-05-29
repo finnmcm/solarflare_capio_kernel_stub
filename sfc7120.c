@@ -59,6 +59,15 @@ static int  sfc7120_fbsd_detach(device_t dev);
 static void sfc7120_interrupt_handler(void *arg);
 static void sfc7120_rx_task_handler(void *context, int pending);
 
+/* EF10 RX prefix: 14-byte pseudo-header prepended when INIT_RXQ FLAG_PREFIX
+ * is set (our flags=0x300 includes bit 8). Layout per ef10_rx.c:737:
+ *   +0x00  hash32 (LE)
+ *   +0x04  outer VLAN (BE)
+ *   +0x06  inner VLAN (BE)
+ *   +0x08  packet length (LE uint16, excl. prefix; 0 = cut-through mode)
+ *   +0x0a  MAC timestamp (LE) */
+#define SFC7120_EF10_RX_PREFIX_LEN  14
+
 #define SFC7120_LOCK_INIT(sc) \
     mtx_init(&(sc)->sc_mtx, device_get_nameunit((sc)->dev), \
              "sfc7120 softc lock", MTX_DEF)
@@ -443,6 +452,39 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
+    error = sfc7120_mcdi_get_phy_cfg(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: GET_PHY_CFG failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    error = sfc7120_mcdi_set_mac(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: SET_MAC failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    error = sfc7120_mcdi_set_link(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: SET_LINK failed: %d\n", error);
+        goto fail_attach;
+    }
+
+    /* Poll for link-up, up to 3 s (30 × 100 ms). Not fatal if it stays
+     * down — cable may be unplugged; we continue and let TX/RX fail later. */
+    for (int i = 0; i < 30; i++) {
+        error = sfc7120_mcdi_get_link(sc);
+        if (error != 0) {
+            device_printf(sc->dev, "hw_init: GET_LINK failed: %d\n", error);
+            goto fail_attach;
+        }
+        if (sc->link_up)
+            break;
+        pause("sfc7120_lnk", hz / 10);
+    }
+    if (!sc->link_up)
+        device_printf(sc->dev, "hw_init: link not up after 3s (cable disconnected?)\n");
+
     return 0;
 
 fail_attach:
@@ -463,6 +505,7 @@ sfc7120_hw_teardown(sfc7120_softc_t *sc)
      * Order matters: FINI_TXQ / FINI_RXQ must complete before FINI_EVQ
      * (firmware returns EBUSY otherwise — RX/TX queues hold a reference to
      * their target EVQ). VADAPTOR_FREE must happen before FREE_VIS. */
+    (void)sfc7120_mcdi_filter_remove(sc);
     (void)sfc7120_mcdi_fini_txq(sc, 0);
     (void)sfc7120_mcdi_fini_rxq(sc, 0);
     (void)sfc7120_mcdi_fini_evq(sc, 0);
@@ -579,6 +622,14 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: init_txq done\n");
 
+    /* Insert RX filter so the MC steers incoming frames to RXQ 0.
+     * Must come after INIT_RXQ since the filter names RX queue 0 as its
+     * destination. Without this, the firmware drops all RX frames. */
+    error = sfc7120_mcdi_filter_insert(sc);
+    if (error != 0) {
+        device_printf(dev, "filter_insert failed: %d\n", error);
+        goto fail_dma;
+    }
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */
@@ -872,8 +923,11 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          * new descriptor is ready. The NIC reads the descriptor, fetches the
          * packet from DMA memory, and transmits it. */
         int posted_idx = sc->tx_head;
-        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_DESC_DBL,
-                          (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1));
+        /* Push TX write pointer via the WRITED2 path.
+         * ERF_DZ_TX_DESC_WPTR lives at dword[2] (LBN=64) of TX_DESC_UPD.
+         * Write to TX_WPTR_DBL = TX_DESC_DBL + 8 = 0x0a18. */
+        uint32_t wptr = (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
+        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_WPTR_DBL, wptr);
 
         /* --- Step 5: poll EVQ for TX completion ---
          * The NIC posts an 8-byte TX_EV event to the EVQ when it finishes
@@ -996,19 +1050,30 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         /* --- Step 4: copy packet from DMA slot to userspace ---
          * sc->rx_buffer is the virtual address the CPU uses to read the
          * DMA memory. We sync first to ensure the NIC's DMA writes are
-         * visible to the CPU, then copyout to userspace. */
+         * visible to the CPU, then strip the 14-byte EF10 prefix before
+         * copying out to userspace. */
         uint8_t *slot_va = (uint8_t *)sc->rx_buffer +
                            sc->rx_head * SFC7120_RX_BUFFER_SIZE;
 
         bus_dmamap_sync(sc->rx_buffer_dtag, sc->rx_buffer_dmamap,
                         BUS_DMASYNC_POSTREAD);
 
-        int copy_err = copyout(slot_va, req->raw_buffer, rx_bytes);
+        /* Read frame length from prefix offset +8 (LE uint16, excl. prefix).
+         * If 0, firmware was in cut-through mode — derive from event bytes. */
+        uint16_t plen = (uint16_t)slot_va[8] | ((uint16_t)slot_va[9] << 8);
+        if (plen == 0) {
+            plen = (rx_bytes > SFC7120_EF10_RX_PREFIX_LEN)
+                   ? (uint16_t)(rx_bytes - SFC7120_EF10_RX_PREFIX_LEN)
+                   : 0;
+        }
+
+        int copy_err = copyout(slot_va + SFC7120_EF10_RX_PREFIX_LEN,
+                               req->raw_buffer, plen);
         if (copy_err != 0) {
             SFC7120_UNLOCK(sc);
             return copy_err;
         }
-        req->length_received = rx_bytes;
+        req->length_received = plen;
 
         /* --- Step 5: re-post the descriptor for this slot ---
          * We just consumed the slot — write the descriptor back into the

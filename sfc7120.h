@@ -181,6 +181,27 @@ typedef struct sfc7120_softc {
     bool rxq_initialized;
     bool txq_initialized;
 
+    /* PHY capability cache — populated by sfc7120_mcdi_get_phy_cfg. */
+    uint32_t            phy_supported_cap_mask;
+    uint32_t            phy_adv_cap_mask;
+    uint32_t            phy_media_type;
+
+    /* Link state — updated by sfc7120_mcdi_get_link. */
+    bool                link_up;
+    bool                full_duplex;
+    uint32_t            link_speed_mbps;
+    uint32_t            link_fcntl;
+
+    /* Bringup completion flags. */
+    bool                mac_configured;
+    bool                link_configured;
+
+    /* RX filter (MC_CMD_FILTER_OP). Inserted after INIT_RXQ so matching RX
+     * frames are steered to RX queue 0. The firmware-returned 64-bit handle
+     * is needed to remove the filter on teardown. */
+    uint64_t            rx_filter_handle;
+    bool                rx_filter_inserted;
+
     bool                debug_reg_ops;
 } sfc7120_softc_t;
 

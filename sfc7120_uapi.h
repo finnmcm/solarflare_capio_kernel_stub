@@ -33,11 +33,6 @@ typedef struct sfc7120_mac_req {
     uint8_t mac_addr[6];
 } sfc7120_mac_req_t;
 
-typedef struct sfc7120_user_packet_descriptor {
-    uint8_t *start_ptr;
-    size_t   length;
-} sfc7120_user_packet_descriptor_t;
-
 typedef struct sfc7120_tx_req {
     void * __capability    user_cap;
     void * __capability    sealed_cap;
@@ -47,14 +42,22 @@ typedef struct sfc7120_tx_req {
     uint8_t                status;
 } sfc7120_tx_req_t;
 
+/*
+ * sfc7120_rx_req_t — kept deliberately small.
+ *
+ * Do NOT embed a large inline array here. _IOWR encodes struct size in a
+ * 13-bit field (IOCPARM_MAX = 8192 bytes). A struct over that limit causes
+ * kern_ioctl to copy fewer bytes than the driver writes back, producing a
+ * kernel stack overflow or silent data corruption. raw_buffer is a pointer
+ * to a userspace-allocated buffer — the received frame is copyout'd there
+ * directly.
+ */
 typedef struct sfc7120_rx_req {
     void * __capability user_cap;
     void * __capability sealed_cap;
 
-    uint8_t                          *raw_buffer;
-    sfc7120_user_packet_descriptor_t  descriptors[SFC7120_NUM_RX_DESC];
-    size_t                            descriptor_length;
-    size_t                            length_received;
+    uint8_t *raw_buffer;
+    size_t   length_received;
 
     uint8_t status;
     uint8_t error;
