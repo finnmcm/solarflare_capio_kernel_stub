@@ -8,6 +8,7 @@
 
 #include "../sfc7120_uapi.h"
 #include "modmap.h"
+#include "capio.h"   /* CAPIO_ATTACH / CAPIO_GOODBYE */
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -16,7 +17,9 @@
 #define DEVSFC7120 "/dev/sfc7120pol1" // our actual module in tree
 #define DEVMODMAP  "/dev/modmap"
 
-typedef struct sfc7120_if { // state struct, everything we need from kernel stub 
+typedef struct sfc7120_if { // state struct, everything we need from kernel stub
+    const char *dev_path;   /* device node to open; NULL → DEVSFC7120 default */
+
     int     fd;
     int     modmap_fd;
 

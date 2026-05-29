@@ -40,9 +40,11 @@ sfc7120_init(sfc7120_if_t *sfc)
     sfc->tx_buffer = NULL;
     sfc->rx_buffer = NULL;
 
-    sfc->fd = open(DEVSFC7120, O_RDWR);
+    const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
+    sfc->fd = open(dev, O_RDWR);
     if (sfc->fd < 0) {
-        perror("sfc7120_init: open " DEVSFC7120);
+        fprintf(stderr, "sfc7120_init: open %s: ", dev);
+        perror(NULL);
         return -1;
     }
 
