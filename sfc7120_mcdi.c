@@ -1351,7 +1351,12 @@ sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance,
 int
 sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance)
 {
-    if (!sc->evq_initialized)
+    /* Each EVQ tracks its own init state. A single shared flag would let the
+     * first fini() call clear it and make the second early-return — leaving
+     * one EVQ initialized in firmware across unload (EALREADY on reload). */
+    bool *donep = (instance == 0) ? &sc->evq_initialized
+                                  : &sc->data_evq_initialized;
+    if (!*donep)
         return 0;
 
     uint8_t buf[MC_CMD_FINI_EVQ_IN_LEN] = {0};
@@ -1366,7 +1371,7 @@ sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance)
         if (rc == EBUSY)
             return rc;
     }
-    sc->evq_initialized = false;
+    *donep = false;
     return rc;
 }
 

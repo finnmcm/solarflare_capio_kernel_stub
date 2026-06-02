@@ -190,7 +190,8 @@ typedef struct sfc7120_softc {
     uint32_t            fw_version[2];    /* hi/lo pair */
     bool                drv_attached;
     bool                vis_allocated;
-    bool                evq_initialized;
+    bool                evq_initialized;       /* control EVQ 0 */
+    bool                data_evq_initialized;  /* data EVQ 1 */
 
     /* vadaptor, tx/rx init flags */
     bool vadaptor_allocated;

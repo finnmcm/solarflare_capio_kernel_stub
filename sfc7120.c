@@ -630,6 +630,11 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: init_evq done (control, EVQ 0)\n");
 
+    /* Control EVQ is up: track its init state (for symmetric fini) and arm
+     * the ISR. The handler only reads EVQ 0, so arming here — before EVQ 1
+     * exists — is safe. */
+    sc->evq_initialized = true;
+
     /* Data EVQ (instance 1): non-interrupting, carries TX/RX completions.
      * Created AFTER EVQ 0 — a non-interrupting EVQ must reference an
      * already-existing interrupting EVQ (EVQ 0) for wake-ups. */
@@ -641,9 +646,8 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: init_evq done (data, EVQ 1)\n");
 
-    /* Both EVQs exist now — arm the ISR. Until this point the handler's
-     * latch (!evq_initialized) makes any MSI-X fire a no-op. */
-    sc->evq_initialized = true;
+    /* Track data EVQ init state for symmetric fini. */
+    sc->data_evq_initialized = true;
 
     /* INITIALIZING RX QUEUE. Args: (instance, target_evq, ...). RXQ 0's
      * completion events are steered to the DATA EVQ (instance 1), not the
@@ -1156,6 +1160,43 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 /* Interrupt handling                                                     */
 /* ---------------------------------------------------------------------- */
 
+/* EF10 event layout (64-bit qword). Only the fields the control ISR parses
+ * are defined here; extend as more event types are wired up. */
+#define SFC7120_EV_CODE_LBN          60     /* top 4 bits of the qword */
+#define SFC7120_EV_CODE_RX           0
+#define SFC7120_EV_CODE_TX           2
+#define SFC7120_EV_CODE_DRIVER       5
+#define SFC7120_EV_CODE_MCDI         12
+
+/* MCDI sub-event layout (bits inside the qword). */
+#define SFC7120_MCDI_EVENT_CODE_LBN  44     /* MCDI subcode field, 8 bits */
+#define SFC7120_MCDI_EV_LINKCHANGE   0x4
+
+/* LINKCHANGE payload layout (low 32 bits of the qword). */
+#define SFC7120_LC_SPEED_SHIFT       16     /* 4 bits */
+#define SFC7120_LC_FCNTL_SHIFT       20     /* 4 bits */
+#define SFC7120_LC_FLAGS_SHIFT       24     /* 8 bits */
+#define SFC7120_LC_FLAG_LINK_UP      (1u << 0)
+#define SFC7120_LC_FLAG_FDX          (1u << 1)
+
+/* EVQ_RPTR doorbell: bits 0..14 are the read-pointer (mod 2^15). */
+#define SFC7120_EVQ_RPTR_MASK        0x7fffu
+
+static uint32_t
+sfc7120_linkchange_speed_mbps(uint32_t code)
+{
+    switch (code) {
+    case 1: return 100;
+    case 2: return 1000;
+    case 3: return 10000;
+    case 4: return 40000;
+    case 5: return 25000;
+    case 6: return 50000;
+    case 7: return 100000;
+    default: return 0;
+    }
+}
+
 static void
 sfc7120_interrupt_handler(void *arg)
 {
@@ -1188,12 +1229,48 @@ sfc7120_interrupt_handler(void *arg)
         if (ev == 0xffffffffffffffffULL || ev == 0)
             break;
 
-        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
-        /* Phase 2 skeleton: just log. LINKCHANGE/MCDI decode lands in
-         * Phase 3. RX_EV/TX_EV never arrive here — they target the data
-         * EVQ (instance 1), which the ioctl poll path drains. */
-        device_printf(sc->dev, "EVQ0 event: code=%#x raw=%#016jx\n",
-                      code, (uintmax_t)ev);
+        uint32_t lo   = (uint32_t)(ev & 0xffffffffu);
+        uint32_t hi   = (uint32_t)(ev >> 32);
+        uint32_t code = (hi >> (SFC7120_EV_CODE_LBN - 32)) & 0xfu;
+
+        switch (code) {
+        case SFC7120_EV_CODE_MCDI: {
+            uint32_t mcdi_code =
+                (hi >> (SFC7120_MCDI_EVENT_CODE_LBN - 32)) & 0xffu;
+            if (mcdi_code == SFC7120_MCDI_EV_LINKCHANGE) {
+                uint32_t flags = (lo >> SFC7120_LC_FLAGS_SHIFT) & 0xffu;
+                uint32_t scode = (lo >> SFC7120_LC_SPEED_SHIFT) & 0xfu;
+                uint32_t fcntl = (lo >> SFC7120_LC_FCNTL_SHIFT) & 0xfu;
+                bool up  = (flags & SFC7120_LC_FLAG_LINK_UP) != 0;
+                bool fdx = (flags & SFC7120_LC_FLAG_FDX) != 0;
+
+                sc->link_up         = up;
+                sc->full_duplex     = fdx;
+                sc->link_speed_mbps = sfc7120_linkchange_speed_mbps(scode);
+                sc->link_fcntl      = fcntl;
+
+                device_printf(sc->dev,
+                    "EVQ LINKCHANGE: link=%s speed=%u Mbps %s fcntl=%u "
+                    "flags=%#x\n", up ? "UP" : "DOWN", sc->link_speed_mbps,
+                    fdx ? "FDX" : "HDX", fcntl, flags);
+            } else {
+                device_printf(sc->dev,
+                    "EVQ MCDI_EV: subcode=%#x ev=%#016jx\n",
+                    mcdi_code, (uintmax_t)ev);
+            }
+            break;
+        }
+        case SFC7120_EV_CODE_DRIVER:
+            device_printf(sc->dev, "EVQ DRIVER_EV: %#016jx\n",
+                          (uintmax_t)ev);
+            break;
+        default:
+            /* RX(0)/TX(2) must never land here — they target the data EVQ.
+             * If one does, the 1c retarget regressed. */
+            device_printf(sc->dev, "EVQ0 event: code=%#x raw=%#016jx\n",
+                          code, (uintmax_t)ev);
+            break;
+        }
 
         ring[sc->evq_read_ptr] = 0;
         sc->evq_read_ptr =
@@ -1211,7 +1288,7 @@ sfc7120_interrupt_handler(void *arg)
         /* EVQ 0's RPTR doorbell IS the hardcoded 0x0400 — correct for the
          * control queue (the per-VI offset issue only affects EVQ 1). */
         SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                          (uint32_t)sc->evq_read_ptr);
+                          (uint32_t)sc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
     }
 
     SFC7120_UNLOCK(sc);
