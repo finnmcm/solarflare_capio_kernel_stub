@@ -92,12 +92,21 @@ typedef struct sfc7120_softc {
     int                 irq_res_id;
     void               *irq_handle;
 
-    /* Event queue (EVQ) — DMA buffer of 64-bit events */
+    /* Control EVQ (instance 0) — DMA buffer of 64-bit events. Interrupting;
+     * carries link/MCDI/error events. The ISR will own this in Phase 2. */
     void               *evq_ring;
     bus_addr_t          evq_ring_paddr;
     bus_dma_tag_t       evq_dtag;
     bus_dmamap_t        evq_dmamap;
     int                 evq_read_ptr;
+
+    /* Data EVQ (instance 1) — non-interrupting; carries TX/RX completions.
+     * The inline TX/RX poll loops read this queue. */
+    void               *data_evq_ring;
+    bus_addr_t          data_evq_ring_paddr;
+    bus_dma_tag_t       data_evq_dtag;
+    bus_dmamap_t        data_evq_dmamap;
+    int                 data_evq_read_ptr;
 
     /* TX resources */
     void               *tx_desc_ring;

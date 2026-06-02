@@ -244,13 +244,25 @@ sfc7120_alloc_dma_resources(sfc7120_softc_t *sc)
     memset(sc->evq_ring, 0xff, evq_size);
     bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap, BUS_DMASYNC_PREWRITE);
 
+    /* Data EVQ ring (instance 1): same geometry as the control EVQ. Primed
+     * to 0xff for the same "valid event" detection as EVQ 0. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->data_evq_dtag, &sc->data_evq_dmamap,
+                                 &sc->data_evq_ring, &sc->data_evq_ring_paddr,
+                                 evq_size, 4096, "data EVQ ring");
+    if (error != 0)
+        goto fail_evq;
+    memset(sc->data_evq_ring, 0xff, evq_size);
+    bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
+                    BUS_DMASYNC_PREWRITE);
+
     /* TX descriptor ring: driver writes outgoing packet descriptors here. */
     error = sfc7120_alloc_dmabuf(sc->dev,
                                  &sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                                  &sc->tx_desc_ring, &sc->tx_desc_ring_paddr,
                                  txd_size, 4096, "TX desc ring");
     if (error != 0)
-        goto fail_evq;
+        goto fail_data_evq;
 
     /* RX descriptor ring: driver writes free buffer addresses here. */
     error = sfc7120_alloc_dmabuf(sc->dev,
@@ -287,6 +299,9 @@ fail_rxd:
 fail_txd:
     sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                         &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+fail_data_evq:
+    sfc7120_free_dmabuf(&sc->data_evq_dtag, &sc->data_evq_dmamap,
+                        &sc->data_evq_ring, &sc->data_evq_ring_paddr);
 fail_evq:
     sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
                         &sc->evq_ring, &sc->evq_ring_paddr);
@@ -304,6 +319,8 @@ sfc7120_free_dma_resources(sfc7120_softc_t *sc)
                         &sc->rx_desc_ring, &sc->rx_desc_ring_paddr);
     sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                         &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+    sfc7120_free_dmabuf(&sc->data_evq_dtag, &sc->data_evq_dmamap,
+                        &sc->data_evq_ring, &sc->data_evq_ring_paddr);
     sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
                         &sc->evq_ring, &sc->evq_ring_paddr);
 }
