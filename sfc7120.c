@@ -57,6 +57,8 @@ static int  sfc7120_fbsd_probe(device_t dev);
 static int  sfc7120_fbsd_attach(device_t dev);
 static int  sfc7120_fbsd_detach(device_t dev);
 static void sfc7120_interrupt_handler(void *arg);
+static int  sfc7120_intr_setup(sfc7120_softc_t *sc);
+static void sfc7120_intr_teardown(sfc7120_softc_t *sc);
 static void sfc7120_rx_task_handler(void *context, int pending);
 
 /* EF10 RX prefix: 14-byte pseudo-header prepended when INIT_RXQ FLAG_PREFIX
@@ -604,6 +606,17 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: alloc_dma_resources done\n");
 
+    /* MSI-X allocation. Runs before INIT_EVQ so the interrupting control EVQ
+     * (0) has its vector ready. A spurious interrupt before
+     * evq_initialized=true is harmless — the handler's latch bails. */
+    device_printf(dev, "TRACE: calling intr_setup\n");
+    error = sfc7120_intr_setup(sc);
+    if (error != 0) {
+        device_printf(dev, "intr_setup failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: intr_setup done\n");
+
     /* INITIALIZING EVENT QUEUE */
     device_printf(dev, "TRACE: calling init_evq\n");
     /* INSTANCE is the *function-local* queue index, not the absolute VI
@@ -627,6 +640,10 @@ sfc7120_fbsd_attach(device_t dev)
         goto fail_dma;
     }
     device_printf(dev, "TRACE: init_evq done (data, EVQ 1)\n");
+
+    /* Both EVQs exist now — arm the ISR. Until this point the handler's
+     * latch (!evq_initialized) makes any MSI-X fire a no-op. */
+    sc->evq_initialized = true;
 
     /* INITIALIZING RX QUEUE. Args: (instance, target_evq, ...). RXQ 0's
      * completion events are steered to the DATA EVQ (instance 1), not the
@@ -756,9 +773,11 @@ sfc7120_fbsd_attach(device_t dev)
     return 0;
 
 fail_dma:
-    /* FINI the queues (inside hw_teardown) BEFORE freeing the DMA rings the
-     * firmware is writing into — otherwise the NIC keeps DMAing into freed
+    /* Stop interrupts first — the ISR reads the EVQ DMA we're about to free.
+     * Then FINI the queues (inside hw_teardown) BEFORE freeing the DMA rings
+     * the firmware is writing into — otherwise the NIC keeps DMAing into freed
      * memory. Can't fall through to fail_hw or we'd call hw_teardown twice. */
+    sfc7120_intr_teardown(sc);
     sfc7120_hw_teardown(sc);
     sfc7120_free_dma_resources(sc);
     goto fail_bar;
@@ -800,6 +819,11 @@ sfc7120_fbsd_detach(device_t dev)
         destroy_dev(sc->cdev);
         sc->cdev = NULL;
     }
+
+    /* Stop interrupts before fini'ing queues / freeing the EVQ DMA the ISR
+     * reads. (dying=true was set above, so the handler already no-ops; this
+     * guarantees the vector is gone before the memory is.) */
+    sfc7120_intr_teardown(sc);
 
     /* Firmware teardown (FINI_TXQ/RXQ/EVQ, VADAPTOR_FREE, FREE_VIS, ...)
      * MUST happen before freeing the DMA rings — otherwise the NIC keeps
@@ -1135,11 +1159,62 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 static void
 sfc7120_interrupt_handler(void *arg)
 {
-    /* TODO: read EVQ, deferred-process events into rx_task. The EF10
-     * event queue is a circular DMA buffer of 64-bit events; software
-     * advances a read pointer and writes a doorbell to acknowledge. */
-    sfc7120_softc_t *sc = (sfc7120_softc_t *)arg;
-    (void)sc;
+    sfc7120_softc_t   *sc = (sfc7120_softc_t *)arg;
+    volatile uint64_t *ring;
+    int                processed = 0;
+
+    /* Safe-to-run latch: bail if the control EVQ isn't up yet or we're
+     * tearing down. An MSI-X vector can fire the instant it's wired (before
+     * INIT_EVQ) or during detach; these checks keep those harmless. */
+    if (sc == NULL || sc->evq_ring == NULL)
+        return;
+    if (sc->dying || !sc->evq_initialized)
+        return;
+
+    ring = (volatile uint64_t *)sc->evq_ring;   /* EVQ 0 = control queue */
+
+    SFC7120_LOCK(sc);
+
+    /* NIC writes events via DMA; sync for CPU reads (BUS_DMA_COHERENT, so
+     * this is a barrier hint rather than a cache flush). */
+    bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+                    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+
+    for (;;) {
+        uint64_t ev = ring[sc->evq_read_ptr];
+
+        /* Slots are 0xff-primed at alloc and zeroed on consume; either
+         * pattern means "no event present". */
+        if (ev == 0xffffffffffffffffULL || ev == 0)
+            break;
+
+        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+        /* Phase 2 skeleton: just log. LINKCHANGE/MCDI decode lands in
+         * Phase 3. RX_EV/TX_EV never arrive here — they target the data
+         * EVQ (instance 1), which the ioctl poll path drains. */
+        device_printf(sc->dev, "EVQ0 event: code=%#x raw=%#016jx\n",
+                      code, (uintmax_t)ev);
+
+        ring[sc->evq_read_ptr] = 0;
+        sc->evq_read_ptr =
+            (sc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+        if (++processed >= SFC7120_NUM_EVQ_ENTRY) {
+            device_printf(sc->dev,
+                "EVQ0: processed full ring without empty marker\n");
+            break;
+        }
+    }
+
+    if (processed > 0) {
+        bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+                        BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+        /* EVQ 0's RPTR doorbell IS the hardcoded 0x0400 — correct for the
+         * control queue (the per-VI offset issue only affects EVQ 1). */
+        SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
+                          (uint32_t)sc->evq_read_ptr);
+    }
+
+    SFC7120_UNLOCK(sc);
 }
 
 static void
@@ -1150,6 +1225,121 @@ sfc7120_rx_task_handler(void *context, int pending)
     sc->rx_received = true;
     selwakeuppri(&sc->selinfo, PZERO + 1);
     SFC7120_RX_UNLOCK(sc);
+}
+
+/* ---------------------------------------------------------------------- */
+/* MSI-X interrupt setup / teardown (control EVQ 0)                       */
+/* ---------------------------------------------------------------------- */
+
+static int
+sfc7120_intr_setup(sfc7120_softc_t *sc)
+{
+    device_t dev = sc->dev;
+    int      count;
+    int      error;
+
+    /* MSI-X table + PBA live in BAR4 on EF10 (16 KB on SFN7322F-R2,
+     * "Table in map 0x20[0x0], PBA in map 0x20[0x2000]" per pciconf -lbv).
+     * Mirror sfxge_intr_setup_msix: allocate the BAR, then ask for vectors. */
+    count = pci_msix_count(dev);
+    if (count <= 0) {
+        device_printf(dev, "intr_setup: MSI-X unavailable\n");
+        return ENXIO;
+    }
+
+    sc->msix_bar_rid = PCIR_BAR(4);
+    sc->msix_bar_resource = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+        &sc->msix_bar_rid, RF_ACTIVE);
+    if (sc->msix_bar_resource == NULL) {
+        device_printf(dev, "intr_setup: BAR4 alloc failed\n");
+        return ENOMEM;
+    }
+
+    /* One vector for the single interrupting (control) EVQ. Multi-vector
+     * arrives when multi-EVQ does. */
+    count = 1;
+    error = pci_alloc_msix(dev, &count);
+    if (error != 0) {
+        device_printf(dev, "intr_setup: pci_alloc_msix failed: %d\n", error);
+        goto fail_bar;
+    }
+    if (count != 1) {
+        device_printf(dev,
+            "intr_setup: pci_alloc_msix granted %d, expected 1\n", count);
+        error = ENXIO;
+        goto fail_msi;
+    }
+    sc->msix_nvec = count;
+
+    /* RID 1 = first MSI-X vector (RID 0 is reserved for legacy INTx). */
+    sc->irq_res_id = 1;
+    sc->irq_resource = bus_alloc_resource_any(dev, SYS_RES_IRQ,
+        &sc->irq_res_id, RF_ACTIVE);
+    if (sc->irq_resource == NULL) {
+        device_printf(dev, "intr_setup: IRQ resource alloc failed\n");
+        error = ENOMEM;
+        goto fail_msi;
+    }
+
+    /* NULL filter: run the handler directly in ithread context, as sfxge
+     * does for MSI-X. */
+    error = bus_setup_intr(dev, sc->irq_resource,
+        INTR_TYPE_NET | INTR_MPSAFE, NULL,
+        sfc7120_interrupt_handler, sc, &sc->irq_handle);
+    if (error != 0) {
+        device_printf(dev, "intr_setup: bus_setup_intr failed: %d\n", error);
+        goto fail_irq;
+    }
+
+    sc->intr_initialized = true;
+    device_printf(dev, "MSI-X: allocated %d vector(s) on BAR4 RID %d\n",
+        sc->msix_nvec, sc->irq_res_id);
+    return 0;
+
+fail_irq:
+    bus_release_resource(dev, SYS_RES_IRQ, sc->irq_res_id, sc->irq_resource);
+    sc->irq_resource = NULL;
+fail_msi:
+    pci_release_msi(dev);
+    sc->msix_nvec = 0;
+fail_bar:
+    bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_bar_rid,
+                         sc->msix_bar_resource);
+    sc->msix_bar_resource = NULL;
+    return error;
+}
+
+static void
+sfc7120_intr_teardown(sfc7120_softc_t *sc)
+{
+    device_t dev = sc->dev;
+
+    /* Tear down the ISR first (bus_teardown_intr waits for any in-flight
+     * handler and guarantees no further fires), then release the IRQ,
+     * MSI-X vectors, and BAR4. Reverse of sfc7120_intr_setup. */
+    if (sc->intr_initialized && sc->irq_resource != NULL &&
+        sc->irq_handle != NULL) {
+        bus_teardown_intr(dev, sc->irq_resource, sc->irq_handle);
+        sc->irq_handle = NULL;
+    }
+    sc->intr_initialized = false;
+
+    if (sc->irq_resource != NULL) {
+        bus_release_resource(dev, SYS_RES_IRQ, sc->irq_res_id,
+                             sc->irq_resource);
+        sc->irq_resource = NULL;
+    }
+
+    if (sc->msix_nvec > 0) {
+        pci_release_msi(dev);
+        sc->msix_nvec = 0;
+    }
+
+    if (sc->msix_bar_resource != NULL) {
+        bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_bar_rid,
+                             sc->msix_bar_resource);
+        sc->msix_bar_resource = NULL;
+    }
 }
 
 /* ---------------------------------------------------------------------- */
