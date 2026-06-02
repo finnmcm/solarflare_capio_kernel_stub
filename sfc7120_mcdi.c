@@ -1125,18 +1125,25 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
      *     command as long as the flag is set; nothing will actually fire
      *     into a vector until we wire up bus_setup_intr later.
      * Bits: INTERRUPTING=0, CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
+    /* EVQ 0 is the interrupting "control" queue; every other EVQ (e.g. the
+     * data queue at index 1) is non-interrupting. */
+    bool interrupting = (instance == 0);
+
     uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
-    if (instance == 0)
+    if (interrupting)
         flags |= (1u << 0);
 
     uint8_t buf[MC_CMD_INIT_EVQ_IN_LEN(1)] = {0};
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_SIZE_OFST)     = nevs;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_INSTANCE_OFST) = instance;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_FLAGS_OFST)    = flags;
-    /* IRQ_NUM (offset 24, unioned with TARGET_EVQ): function-relative
-     * vector for interrupting EVQs. For index 0 with INTERRUPTING set,
-     * sfxge writes irq=index (i.e. 0); we mirror that. */
-    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST) = instance;
+    /* IRQ_NUM (offset 24, unioned with TARGET_EVQ): for an interrupting EVQ
+     * this is the function-relative MSI-X vector; for a non-interrupting EVQ
+     * it must name an interrupting EVQ to ride for wake-ups. sfxge uses the
+     * always-interrupting index 0, so: vector=instance if interrupting, else
+     * 0. (Both resolve to 0 today since EVQ 0 is our only interrupting one.) */
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST) =
+        interrupting ? instance : 0;
     *(uint64_t *)(buf + MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST) = paddr;
 
     device_printf(sc->dev,

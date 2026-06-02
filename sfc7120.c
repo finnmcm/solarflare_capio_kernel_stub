@@ -525,7 +525,8 @@ sfc7120_hw_teardown(sfc7120_softc_t *sc)
     (void)sfc7120_mcdi_filter_remove(sc);
     (void)sfc7120_mcdi_fini_txq(sc, 0);
     (void)sfc7120_mcdi_fini_rxq(sc, 0);
-    (void)sfc7120_mcdi_fini_evq(sc, 0);
+    (void)sfc7120_mcdi_fini_evq(sc, 1);   /* data EVQ first (reverse of init) */
+    (void)sfc7120_mcdi_fini_evq(sc, 0);   /* control EVQ — the wakeup anchor */
     (void)sfc7120_mcdi_vadaptor_free(sc);
     (void)sfc7120_mcdi_free_vis(sc);
     (void)sfc7120_mcdi_drv_detach(sc);
@@ -614,12 +615,24 @@ sfc7120_fbsd_attach(device_t dev)
         device_printf(dev, "init_evq failed: %d\n", error);
         goto fail_dma;
     }
-    device_printf(dev, "TRACE: init_evq done\n");
+    device_printf(dev, "TRACE: init_evq done (control, EVQ 0)\n");
 
-    /* INITIALIZING RX QUEUE. instance and target_evq are function-local
-     * indices (0..vi_count-1), matching EVQ instance 0 above. */
+    /* Data EVQ (instance 1): non-interrupting, carries TX/RX completions.
+     * Created AFTER EVQ 0 — a non-interrupting EVQ must reference an
+     * already-existing interrupting EVQ (EVQ 0) for wake-ups. */
+    error = sfc7120_mcdi_init_evq(sc, 1, sc->data_evq_ring_paddr,
+                                  SFC7120_NUM_EVQ_ENTRY);
+    if (error != 0) {
+        device_printf(dev, "init_evq(data) failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: init_evq done (data, EVQ 1)\n");
+
+    /* INITIALIZING RX QUEUE. Args: (instance, target_evq, ...). RXQ 0's
+     * completion events are steered to the DATA EVQ (instance 1), not the
+     * control EVQ — this retarget is what frees EVQ 0 to become control-only. */
     device_printf(dev, "TRACE: calling init_rxq\n");
-    error = sfc7120_mcdi_init_rxq(sc, 0, 0, sc->rx_desc_ring_paddr,
+    error = sfc7120_mcdi_init_rxq(sc, 0, 1, sc->rx_desc_ring_paddr,
                                   SFC7120_NUM_RX_DESC);
     if (error != 0) {
         device_printf(dev, "init_rxq failed: %d\n", error);
@@ -629,9 +642,10 @@ sfc7120_fbsd_attach(device_t dev)
 
     sfc7120_post_rx_buffers(sc);
 
-    /* INITIALIZING TX QUEUE */
+    /* INITIALIZING TX QUEUE. TXQ 0's completion events likewise go to the
+     * DATA EVQ (instance 1). */
     device_printf(dev, "TRACE: calling init_txq\n");
-    error = sfc7120_mcdi_init_txq(sc, 0, 0, sc->tx_desc_ring_paddr,
+    error = sfc7120_mcdi_init_txq(sc, 0, 1, sc->tx_desc_ring_paddr,
                                   SFC7120_NUM_TX_DESC);
     if (error != 0) {
         device_printf(dev, "init_txq failed: %d\n", error);
@@ -953,12 +967,14 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          *   bits[15:0]   TX_DESCR_INDX — index of completed descriptor
          *
          * We spin up to 10000 iterations waiting for it. */
-        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        /* Since 1c, TXQ 0 completions land in the DATA EVQ (instance 1), so
+         * we poll data_evq_ring — not the control EVQ. */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int tx_done = 0;
         for (int tries = 0; tries < 10000 && !tx_done; tries++) {
-            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
-            uint64_t ev = evq[sc->evq_read_ptr];
+            uint64_t ev = evq[sc->data_evq_read_ptr];
 
             /* All-ones or all-zeros means no event written yet. */
             if (ev == 0xffffffffffffffffULL || ev == 0)
@@ -973,11 +989,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             }
 
             /* Consume the event regardless — advance past it. */
-            evq[sc->evq_read_ptr] = 0;
-            sc->evq_read_ptr =
-                (sc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                              (uint32_t)sc->evq_read_ptr);
+            evq[sc->data_evq_read_ptr] = 0;
+            sc->data_evq_read_ptr =
+                (sc->data_evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+            /* NOTE (1d barebones): the data EVQ's RPTR doorbell sits at a
+             * different per-VI offset than EVQ 0's hardcoded 0x0400. Writing
+             * 0x0400 here would corrupt the control EVQ, so we skip the
+             * doorbell for now — over a short burst the events still land and
+             * we still read them. Correct per-VI RPTR write comes with the
+             * slice/doorbell work later. */
         }
 
         /* --- Step 6: advance tx_head --- */
@@ -1011,15 +1031,16 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 
         SFC7120_LOCK(sc);
 
-        /* --- Step 1: poll EVQ for an RX event --- */
-        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        /* --- Step 1: poll the DATA EVQ for an RX event ---
+         * Since 1c, RXQ 0 completions land in the data EVQ (instance 1). */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int    rx_found = 0;
         uint32_t rx_bytes = 0;
 
         for (int tries = 0; tries < 100000 && !rx_found; tries++) {
-            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
-            uint64_t ev = evq[sc->evq_read_ptr];
+            uint64_t ev = evq[sc->data_evq_read_ptr];
 
             if (ev == 0xffffffffffffffffULL || ev == 0)
                 continue;
@@ -1033,11 +1054,12 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             }
 
             /* Consume event regardless of type. */
-            evq[sc->evq_read_ptr] = 0;
-            sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
+            evq[sc->data_evq_read_ptr] = 0;
+            sc->data_evq_read_ptr = (sc->data_evq_read_ptr + 1) &
                                (SFC7120_NUM_EVQ_ENTRY - 1);
-            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                              (uint32_t)sc->evq_read_ptr);
+            /* NOTE (1d barebones): data EVQ's RPTR doorbell is at a different
+             * per-VI offset than EVQ 0's hardcoded 0x0400 — skip it for now to
+             * avoid corrupting the control EVQ (see TX path note above). */
         }
 
         if (!rx_found) {
