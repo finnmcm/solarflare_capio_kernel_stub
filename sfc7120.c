@@ -591,6 +591,21 @@ sfc7120_fbsd_attach(device_t dev)
     sc->mem_bsh     = rman_get_bushandle(sc->mem_resource);
     device_printf(dev, "TRACE: BAR2 mapped, paddr=0x%lx size=0x%lx\n",
         rman_get_start(sc->mem_resource), rman_get_size(sc->mem_resource));
+
+    /* CAPIO is_physical regions hand userspace rman_get_start() as if it were a
+     * CPU physical address (capio.c feeds it straight to vm_page_getfake), with
+     * no host-bridge translation. The kernel's own reads go through mem_bsh,
+     * which IS translated. If these two disagree, userspace maps the wrong
+     * physical page and reads RAZ (0) with no CHERI trap — exactly the
+     * HW_REV_ID-via-slice symptom. MATCH => address is fine, look elsewhere. */
+    {
+        vm_paddr_t bus_start = (vm_paddr_t)rman_get_start(sc->mem_resource);
+        vm_paddr_t true_pa   = pmap_kextract((vm_offset_t)sc->mem_bsh);
+        device_printf(dev,
+            "BAR2 PA check: rman_get_start=0x%lx  pmap_kextract(mem_bsh)=0x%lx (%s)\n",
+            (u_long)bus_start, (u_long)true_pa,
+            bus_start == true_pa ? "MATCH" : "MISMATCH — capio maps wrong PA");
+    }
     pci_enable_busmaster(dev);
 
     /* 2. Hardware bringup (MCDI handshake, queue init). */
