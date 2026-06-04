@@ -264,9 +264,10 @@ on every post.
 IOCTLs: `CAPIO_ATTACH` / `CAPIO_GOODBYE` (capio.h), `SFC7120_TX` / `SFC7120_RX` /
 `SFC7120_GET_MAC` (`../sfc7120_uapi.h`).
 
-Slice manifest (`../sfc7120_tables.c`): `MC_DOORBELL`, `EVQ_RPTR_DBL`,
-`RX_DESC_DBL`, `TX_DESC_DBL` (12 B), `HW_REV_ID` (RO). **These are VI-0 offsets
-and must be corrected to the data-path VIs in Phase B.**
+Slice manifest (`../sfc7120_tables.c`, corrected in Phase B): `MC_DOORBELL`
+(`0x200`), `DATA_EVQ_RPTR_DBL` (`0x2400` — instance 1's window),
+`RX_DESC_DBL` (`0x830`), `TX_DESC_DBL` (`0xa10`, 12 B), `HW_REV_ID` (RO).
+The control EVQ 0 RPTR (`0x400`) is deliberately not exposed — kernel-owned.
 
 ### What must be added (Phases A–B)
 
@@ -303,13 +304,14 @@ counts (512 each), and current head pointers.
 `smem[]`; old `sfctest` ioctl path still passes; the three new regions mmap at
 4 KB; `GET_VI_INFO` returns sane PAs and `vi_base`.
 
-### 🔜 Phase B — Kernel: correct the slice manifest for the data-path VIs
-Fix/extend `../sfc7120_tables.c`: data-EVQ RPTR at `(evq_inst<<13)+0x400`, RXQ
-`RX_DESC_UPD` at `(rxq_inst<<13)+0x830`, TXQ `TX_DESC_UPD` at
-`(txq_inst<<13)+0xa10` (12 B). Cross-check against the offsets the working kernel
-handlers write.
-**Verify:** userspace maps the sliced MMIO and reads `HW_REV_ID`; an out-of-slice
-doorbell write **traps** (CHERI bounds) rather than corrupting the device.
+### ✅ Phase B — Kernel: correct the slice manifest for the data-path VIs (done 2026-06-03)
+Per-VI window math + `SFC7120_REG_DATA_*` offsets added to
+`../sfc7120_mmio.h`; manifest now exposes `DATA_EVQ_RPTR_DBL` at `0x2400`
+and drops the kernel-owned control EVQ 0 RPTR (`0x400`). Bonus: TX/RX ioctl
+handlers now ack the data EVQ at `0x2400` (previously skipped).
+**Verified on hardware (2026-06-03):** `sfctest tx`/`rx` passes with every
+TX/RX ringing `0x2400`. Userspace slice verify (HW_REV_ID read,
+out-of-slice trap) folded into Phase C.
 
 ### 🔜 Phase C — Userspace: direct EVQ polling (read path first)
 Implement `sfc7120_poll` over the mapped data-EVQ ring: all-`0xFF` empty
@@ -317,7 +319,9 @@ detection, decode RX_EV/TX_EV, advance the read pointer, write the EVQ-1 RPTR
 doorbell through the MMIO slice cap, `dsb sy`. Keep the kernel posting
 descriptors for now.
 **Verify:** poll reports the same events, in order, that the ioctl oracle
-consumes.
+consumes. Also (carried from Phase B): read `HW_REV_ID` through its slice
+cap, and confirm an out-of-slice doorbell write **traps** (CHERI bounds)
+rather than corrupting the device.
 
 ### 🔜 Phase D — Userspace: direct RX (post + doorbell)
 Pre-post RX descriptors into the mapped `rx_desc_ring`
