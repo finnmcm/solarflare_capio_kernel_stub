@@ -114,16 +114,20 @@ typedef struct sfc7120_vi_info_req {
 } sfc7120_vi_info_req_t;
 
 /*
- * sfc7120_evq_sync_req_t — userspace reports its final data-EVQ read pointer
- * back to the kernel at teardown (phase C+). The direct poll path consumes
- * events the kernel never sees; without this sync the next run's GET_VI_INFO
- * hands out a stale evq_read_ptr. Extends to tx_head/rx_head in later phases.
+ * sfc7120_evq_sync_req_t — userspace reports its final data-path pointers back
+ * to the kernel at teardown (phase C+). The direct TX/RX/poll paths advance
+ * their own copies of the EVQ read pointer and the TX/RX ring heads, which the
+ * kernel never sees; without this sync the next run's GET_VI_INFO hands out
+ * stale seeds and the data path desyncs from the NIC (whose queue state
+ * persists across opens — INIT_*Q runs once per module load, not per open).
  */
 typedef struct sfc7120_evq_sync_req {
     void * __capability user_cap;
     void * __capability sealed_cap;
 
     uint32_t evq_read_ptr;      /* userspace's final data-EVQ read pointer */
+    uint32_t tx_head;           /* userspace's final TX producer index */
+    uint32_t rx_head;           /* userspace's final RX consume/post index */
 } sfc7120_evq_sync_req_t;
 
 /* IOCTLs — 'S' group matches the kernel definition. */

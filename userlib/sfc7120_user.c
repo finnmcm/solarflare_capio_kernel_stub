@@ -114,6 +114,7 @@ sfc7120_init(sfc7120_if_t *sfc)
     sfc->evq_read_ptr    = 0;
     sfc->used_poll       = false;
     sfc->rx_head         = 0;
+    sfc->tx_head         = 0;
     memset(sfc->region_maps, 0, sizeof(sfc->region_maps));
 
     const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
@@ -199,6 +200,9 @@ sfc7120_init(sfc7120_if_t *sfc)
      * kernel already seeded the RX ring at attach (sfc7120_post_rx_buffers),
      * so direct RX just consumes + re-posts from here. */
     sfc->rx_head = sfc->vi_info.rx_head;
+    /* Seed our TX producer slot from the kernel's index so we stay aligned
+     * with the NIC's persistent TX read pointer across re-opens. */
+    sfc->tx_head = sfc->vi_info.tx_head;
 
     sfc7120_mac_req_t mac_req;
     mac_req.user_cap   = sfc->cap_req.user_cap;
@@ -461,6 +465,104 @@ sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
     return 0;
 }
 
+/*
+ * sfc7120_tx_direct — transmit one packet straight from the mapped rings, with
+ * the kernel out of the data path (Phase E). The userspace mirror of the
+ * kernel SFC7120_TX handler (../sfc7120.c): identical descriptor layout,
+ * WPTR-only doorbell push, and TX_EV completion match — only the rings and
+ * doorbells are touched directly through CHERI capabilities, not via ioctl.
+ *
+ * Blocking: posts the descriptor, then spins the data EVQ (instance 1) for
+ * the matching TX completion. Returns 0 on success, -1 on bad arguments or
+ * if the completion never arrives.
+ *
+ * Single-owner contract: nothing else may consume this PF's data EVQ while
+ * direct TX runs — no kernel SFC7120_TX/RX ioctls on this fd.
+ */
+int
+sfc7120_tx_direct(sfc7120_if_t *sfc, const void *buf, size_t len)
+{
+    /* --- Step 0: guards + claim EVQ ownership for this session --- */
+    if (sfc == NULL || buf == NULL)
+        return -1;
+    if (sfc->tx_buffer == NULL || sfc->tx_desc_ring == NULL ||
+        sfc->evq_ring == NULL || sfc->mmio_slices == NULL ||
+        sfc->mmio_slices_len <= SFC7120_SLICE_TX_DESC_DBL)
+        return -1;
+    if (len == 0 || len > SFC7120_TX_BUFFER_SIZE)
+        return -1;
+
+    sfc->used_poll = true;
+
+    volatile uint64_t *evq     = (volatile uint64_t *)sfc->evq_ring;
+    volatile uint64_t *tx_ring = (volatile uint64_t *)sfc->tx_desc_ring;
+    uint8_t           *txbuf   = (uint8_t *)sfc->tx_buffer;
+
+    /* --- Step 1: copy the packet into the TX buffer slot --- */
+    uint8_t *slot = txbuf + (size_t)sfc->tx_head * SFC7120_TX_BUFFER_SIZE;
+    memcpy(slot, buf, len);
+
+    /* --- Step 2: build the 8-byte TX descriptor (kernel layout verbatim) ---
+     * bits[61:48] BYTE_CNT (packet length), bits[47:32] bus addr high 16,
+     * bits[31:0] bus addr low 32. TYPE/CONT (bits 63/62) = 0 (kernel desc,
+     * end-of-packet). */
+    uint64_t slot_pa = sfc->vi_info.tx_buffer_paddr +
+                       (uint64_t)sfc->tx_head * SFC7120_TX_BUFFER_SIZE;
+    tx_ring[sfc->tx_head] =
+        ((uint64_t)(len & 0x3fff)             << 48) |
+        ((uint64_t)((slot_pa >> 32) & 0xffff) << 32) |
+        ((uint64_t)(slot_pa & 0xffffffff));
+
+    /* --- Step 3: ring the TX doorbell (WPTR-only push at slice +8 = 0xa18) ---
+     * dsb sy orders the packet + descriptor stores before the doorbell kick.
+     * The TX_DESC_DBL slice is 12 bytes; dword index [2] is byte offset +8. */
+    int      posted_idx = sfc->tx_head;
+    uint32_t wptr = (uint32_t)(sfc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
+    __asm__ volatile("dsb sy" ::: "memory");
+    ((volatile uint32_t * __capability)
+        sfc->mmio_slices[SFC7120_SLICE_TX_DESC_DBL].addr)[2] = wptr;
+
+    /* --- Step 4: poll the data EVQ for our TX completion ---
+     * TX_EV = code 2, TX_DESCR_INDX in bits[15:0]. Consume every event we
+     * pass (zero slot, advance read pointer); done when comp_idx matches the
+     * descriptor we just posted. Exact-match mirrors the kernel oracle. */
+    int      tx_done  = 0;
+    int      consumed = 0;
+    const long TX_WAIT_BUDGET = 100000000L;
+
+    for (long tries = 0; tries < TX_WAIT_BUDGET && !tx_done; tries++) {
+        uint64_t ev = evq[sfc->evq_read_ptr];
+
+        if (ev == 0xffffffffffffffffULL || ev == 0)
+            continue;
+
+        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+        if (code == 2) {            /* TX_EV */
+            uint32_t comp_idx = (uint32_t)(ev & 0xffff);
+            if (comp_idx == (uint32_t)posted_idx)
+                tx_done = 1;
+        }
+
+        evq[sfc->evq_read_ptr] = 0;
+        sfc->evq_read_ptr =
+            (sfc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+        consumed++;
+    }
+
+    /* --- Step 5: ack consumed events on the EVQ-1 RPTR doorbell (0x2400) --- */
+    if (consumed > 0) {
+        __asm__ volatile("dsb sy" ::: "memory");
+        *(volatile uint32_t * __capability)
+            sfc->mmio_slices[SFC7120_SLICE_DATA_EVQ_RPTR_DBL].addr =
+            sfc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK;
+    }
+
+    /* --- Step 6: advance tx_head --- */
+    sfc->tx_head = (sfc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
+
+    return tx_done ? 0 : -1;
+}
+
 void
 sfc7120_destroy(sfc7120_if_t *sfc)
 {
@@ -506,6 +608,8 @@ sfc7120_destroy(sfc7120_if_t *sfc)
         sync_req.user_cap     = sfc->cap_req.user_cap;
         sync_req.sealed_cap   = sfc->cap_req.sealed_cap;
         sync_req.evq_read_ptr = sfc->evq_read_ptr;
+        sync_req.tx_head      = sfc->tx_head;
+        sync_req.rx_head      = sfc->rx_head;
         if (ioctl(sfc->fd, SFC7120_SET_EVQ_RPTR, &sync_req) < 0)
             perror("sfc7120_destroy: SFC7120_SET_EVQ_RPTR");
     }

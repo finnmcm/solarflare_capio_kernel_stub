@@ -105,6 +105,47 @@ run_producer(void)
     return 0;
 }
 
+/*
+ * run_producer_direct — Phase E producer: transmits via sfc7120_tx_direct
+ * (userspace posts the descriptor + rings the doorbell + polls the TX_EV,
+ * kernel out of the data path) instead of the SFC7120_TX ioctl. Pair with
+ * `sfctest rxd` on PF1 for a full direct-path dual-port test.
+ */
+static int
+run_producer_direct(void)
+{
+    sfc7120_if_t sfc = { .dev_path = DEV_PF0 };
+    uint8_t      dst[6], frame[FRAME_LEN];
+
+    if (sfc7120_init(&sfc) != 0) {
+        fprintf(stderr, "test: direct producer init failed\n");
+        return 1;
+    }
+    printf("test: direct producer up on %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+           DEV_PF0, sfc.mac_addr[0], sfc.mac_addr[1], sfc.mac_addr[2],
+           sfc.mac_addr[3], sfc.mac_addr[4], sfc.mac_addr[5]);
+    dump_vi_state(&sfc);
+    printf("test: direct TX from tx_head=%u\n", sfc.tx_head);
+
+    /* PF1 MAC = PF0 base MAC + 1 in the low octet. */
+    memcpy(dst, sfc.mac_addr, 6);
+    dst[5] += 1;
+
+    for (int i = 0; i < TEST_PACKETS; i++) {
+        build_frame(frame, dst, sfc.mac_addr, i);
+        if (sfc7120_tx_direct(&sfc, frame, FRAME_LEN) != 0) {
+            fprintf(stderr, "test: direct TX %d failed\n", i);
+            sfc7120_destroy(&sfc);
+            return 1;
+        }
+        printf("test: direct TX %d ok (%d bytes)\n", i, FRAME_LEN);
+    }
+
+    sfc7120_destroy(&sfc);
+    printf("test: direct producer done\n");
+    return 0;
+}
+
 static int
 run_consumer(void)
 {
@@ -231,11 +272,13 @@ int
 main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s tx|rx|rxd|poll\n", argv[0]);
+        fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "tx") == 0)
         return run_producer();
+    if (strcmp(argv[1], "txd") == 0)
+        return run_producer_direct();
     if (strcmp(argv[1], "rx") == 0)
         return run_consumer();
     if (strcmp(argv[1], "rxd") == 0)
@@ -243,6 +286,6 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "poll") == 0)
         return run_poller();
 
-    fprintf(stderr, "usage: %s tx|rx|rxd|poll\n", argv[0]);
+    fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll\n", argv[0]);
     return 2;
 }

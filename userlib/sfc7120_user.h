@@ -74,6 +74,8 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
                                     * pointer and must NOT be clobbered. */
     uint32_t rx_head;              /* our RX slot to consume + re-post next;
                                     * seeded from vi_info.rx_head (direct RX) */
+    uint32_t tx_head;              /* our TX producer slot; seeded from
+                                    * vi_info.tx_head (direct TX) */
 
     /* Per-region mapping record for munmap at destroy; indexed by
      * sfc7120_vm_map_type_t. For the sliced MMIO region, base is the
@@ -89,6 +91,7 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
 int  sfc7120_init(sfc7120_if_t *sfc);
 void sfc7120_destroy(sfc7120_if_t *sfc);
 int  sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len);
+int  sfc7120_tx_direct(sfc7120_if_t *sfc, const void *buf, size_t len);
 int  sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out);
 int  sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out);
 int  sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs);
