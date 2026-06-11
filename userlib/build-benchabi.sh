@@ -1,13 +1,21 @@
 #!/bin/sh
 #
-# build.sh — cross-compile the sfc7120 userspace TX/RX test (sfctest) and the
-# latency/throughput benchmark (sfcbench) for the Morello board, or build
-# natively on CheriBSD.
+# build-benchabi.sh — cross-compile sfctest/sfcbench for the Morello
+# *purecap-benchmark ABI*, or build natively on CheriBSD.
 #
-# Output: ./sfctest and ./sfcbench (Morello purecap binaries)
+# The benchmark ABI is identical to purecap (same CheriABI syscalls, same
+# 16-byte capabilities, CAPIO token round-trip untouched) except code
+# pointers use integer branches instead of capability branches — removing
+# the Morello prototype's cap-branch microarchitectural penalty. Comparing
+# these binaries against the purecap ones from build.sh isolates that
+# penalty from genuine capability overhead.
+#
+# Output: ./sfctest-cb and ./sfcbench-cb (benchmark-ABI binaries; the
+# CheriBSD image activator routes them to ld-elf64cb.so.1 + /usr/lib64cb
+# via the NT_CHERI_MORELLO_PURECAP_BENCHMARK_ABI ELF note).
 #
 # Usage:
-#   ./build.sh [build|clean|help]
+#   ./build-benchabi.sh [build|clean|help]
 #
 # Env overrides:
 #   CHERI_ROOT     CHERI build root (default: $HOME/cheri)
@@ -22,11 +30,14 @@ MODMAP_INC="${MODMAP_INC:-$HOME/E1000Lwip/include/netif}"
 SDK="$CHERI_ROOT/output/morello-sdk"
 CLANG="$SDK/bin/clang"
 PURECAP_CFG="$SDK/bin/cheribsd-morello-purecap.cfg"
+# No SDK .cfg ships for the benchmark ABI; -mabi after --config overrides
+# the cfg's -mabi=purecap and the driver switches its multilib to lib64cb.
+ABI_FLAGS="-mabi=purecap-benchmark"
 
 SRCS="test.c sfc7120_user.c"
-OUT="sfctest"
+OUT="sfctest-cb"
 BENCH_SRCS="bench.c sfc7120_user.c"
-BENCH_OUT="sfcbench"
+BENCH_OUT="sfcbench-cb"
 CFLAGS="-Wall -O2 -g -I$MODMAP_INC"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,19 +51,19 @@ build() {
     fi
 
     if [ "$(uname -s)" = "FreeBSD" ]; then
-        # Native build on the Morello board: cc already targets purecap.
-        echo "Native build (CheriBSD)"
-        cc $CFLAGS $SRCS -o "$OUT"
-        cc $CFLAGS $BENCH_SRCS -o "$BENCH_OUT"
+        # Native build on the Morello board: base cc is Morello clang.
+        echo "Native build (CheriBSD, purecap-benchmark ABI)"
+        cc $ABI_FLAGS $CFLAGS $SRCS -o "$OUT"
+        cc $ABI_FLAGS $CFLAGS $BENCH_SRCS -o "$BENCH_OUT"
     else
-        echo "Cross-compiling for Morello purecap"
+        echo "Cross-compiling for Morello purecap-benchmark ABI"
         if [ ! -x "$CLANG" ] || [ ! -f "$PURECAP_CFG" ]; then
             echo "Error: Morello SDK not found at $SDK"
             echo "       build it with cheribuild (cheribsd-morello-purecap), or set CHERI_ROOT"
             exit 1
         fi
-        "$CLANG" --config "$PURECAP_CFG" $CFLAGS $SRCS -o "$OUT"
-        "$CLANG" --config "$PURECAP_CFG" $CFLAGS $BENCH_SRCS -o "$BENCH_OUT"
+        "$CLANG" --config "$PURECAP_CFG" $ABI_FLAGS $CFLAGS $SRCS -o "$OUT"
+        "$CLANG" --config "$PURECAP_CFG" $ABI_FLAGS $CFLAGS $BENCH_SRCS -o "$BENCH_OUT"
     fi
     echo "Build complete: $SCRIPT_DIR/$OUT $SCRIPT_DIR/$BENCH_OUT"
 }

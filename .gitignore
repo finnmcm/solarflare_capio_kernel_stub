@@ -80,3 +80,8 @@ scratch_notes.md
 
 # Personal work log (not for the repo)
 userlib/LOG.md
+PAPER.md
+
+# Benchmark-ABI build products (build-benchabi.sh)
+userlib/sfctest-cb
+userlib/sfcbench-cb

@@ -370,12 +370,17 @@ sfc7120_post_rx_buffers(sfc7120_softc_t *sc)
      *   bits[47:32] — upper 16 bits of the slot's physical address
      *   bits[31:0]  — lower 32 bits of the slot's physical address
      *
-     * We post NUM_RX_DESC-1 slots, leaving one empty. If we filled all 512
-     * the write pointer would wrap back to 0, which looks identical to an
-     * empty ring. Leaving one slot unposted keeps the pointer unambiguous.
+     * We POPULATE all NUM_RX_DESC ring entries with valid descriptors but only
+     * ADVERTISE npost = NUM_RX_DESC-1 of them via the doorbell. Advertising all
+     * 512 would wrap the write pointer to 0, which the NIC reads as "ring
+     * empty"; leaving one slot unadvertised keeps the producer pointer
+     * unambiguous. We still write slot 511's descriptor (rather than leaving it
+     * zero) so that once the data-path re-post advances the producer onto it
+     * — which the 8-aligned WPTR batching does on the first ring wrap — the NIC
+     * fills a real buffer instead of a garbage (zero-address) descriptor.
      */
     int npost = SFC7120_NUM_RX_DESC - 1;
-    for (int i = 0; i < npost; i++) {
+    for (int i = 0; i < SFC7120_NUM_RX_DESC; i++) {
         bus_addr_t paddr = sc->rx_buffer_paddr + i * SFC7120_RX_BUFFER_SIZE;
         uint64_t desc =
             ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48) |
@@ -1098,7 +1103,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             dbg_evs_seen++;
 
             if (code == 2) { /* TX_EV */
-                uint32_t comp_idx = (uint32_t)(ev & 0xffff);
+                /* TX_DESCR_INDX is the low 16 bits of a FREE-RUNNING
+                 * completed-descriptor counter, not a mod-ring-size index —
+                 * mask to the ring before comparing (sfxge sfxge_ev.c:
+                 * `stop = (id + 1) & txq->ptr_mask`). Unmasked comparison
+                 * only matched while cumulative TX count stayed below the
+                 * ring size; direct-path sessions advance the counter
+                 * arbitrarily. */
+                uint32_t comp_idx = (uint32_t)(ev & 0xffff) &
+                                    (SFC7120_NUM_TX_DESC - 1);
                 dbg_tx_evs++;
                 dbg_last_txidx = comp_idx;
                 if (comp_idx == (uint32_t)posted_idx) {

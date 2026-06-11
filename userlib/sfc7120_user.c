@@ -407,8 +407,17 @@ sfc7120_rx_recv(sfc7120_if_t *sfc, void *buf, size_t *len_out, uint16_t rx_bytes
         ((uint64_t)(slot_pa & 0xffffffff));
 
     /* dsb sy orders the descriptor store before the doorbell kick; ring the
-     * RX producer doorbell (rx_head verbatim — 8-aligned batching is Phase G);
-     * then advance rx_head. */
+     * RX producer doorbell (rx_head verbatim, pre-increment) then advance
+     * rx_head. This is a verbatim port of the kernel RX oracle
+     * (../sfc7120.c:1300-1302), which rings per-packet with the pre-increment
+     * rx_head and is the verified, "bulletproof" path for this card's
+     * low-latency firmware. An 8-aligned batched re-post was tried as a
+     * Phase-G optimization but starved the NIC's RX ring on long runs (the
+     * cumulative-producer seed conflated rx_head+511 with the NIC's actual
+     * producer pointer, so the doorbell was withheld and buffers were never
+     * handed back) — sfcbench's window=1 latency sweep timed out on PF1 RX
+     * after a few hundred frames. Per-packet ring matches the oracle; don't
+     * re-batch without re-deriving the producer from the NIC's real pointer. */
     __asm__ volatile("dsb sy" ::: "memory");
     *(volatile uint32_t * __capability)
         sfc->mmio_slices[SFC7120_SLICE_RX_DESC_DBL].addr = sfc->rx_head;

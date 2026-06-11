@@ -39,7 +39,9 @@ typedef enum {
 
 typedef struct sfc7120_ev {
     sfc7120_ev_type_t type;
-    uint16_t tx_desc_idx;  /* TX_EV: completed descriptor index (ev & 0xffff) */
+    uint16_t tx_desc_idx;  /* TX_EV: low 16 bits of the FREE-RUNNING completed-
+                            * descriptor counter (ev & 0xffff) — mask with
+                            * (ring size - 1) before comparing to a ring index */
     uint16_t rx_bytes;     /* RX_EV: byte count incl. 14-byte prefix (ev & 0x3fff) */
     uint64_t raw;          /* raw 8-byte event word */
 } sfc7120_ev_t;
@@ -73,7 +75,10 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
                                     * ioctl-only path the kernel owns the EVQ
                                     * pointer and must NOT be clobbered. */
     uint32_t rx_head;              /* our RX slot to consume + re-post next;
-                                    * seeded from vi_info.rx_head (direct RX) */
+                                    * seeded from vi_info.rx_head (direct RX).
+                                    * Re-posting rings RX_DESC_DBL per-packet
+                                    * with this pre-increment value, matching
+                                    * the kernel oracle (../sfc7120.c:1300). */
     uint32_t tx_head;              /* our TX producer slot; seeded from
                                     * vi_info.tx_head (direct TX) */
 

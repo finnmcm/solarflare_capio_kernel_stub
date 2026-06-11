@@ -2,12 +2,12 @@
 #define CAPIO_H
 
 #include <sys/types.h>
-#include <sys/param.h>       
-#include <sys/conf.h>        
-#include <sys/mutex.h>       
-#include <sys/ioccom.h>      
-#include <cheri/cheric.h>    
-#include <cheri/cheri.h>     
+#include <sys/param.h>
+#include <sys/conf.h>
+#include <sys/mutex.h>
+#include <sys/ioccom.h>
+#include <cheri/cheric.h>
+#include <cheri/cheri.h>
 
 typedef bool    (is_dying_t)(void *sc);
 typedef size_t  (get_buffer_size_t)(void *sc, int type);
